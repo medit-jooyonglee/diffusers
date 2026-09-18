@@ -1,0 +1,901 @@
+import argparse
+import json
+import gc
+import re
+from pathlib import Path
+
+import numpy as np
+import torch
+from accelerate import Accelerator
+from accelerate.utils import ProjectConfiguration, set_seed
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
+
+from diffusers import FlowMatchEulerDiscreteScheduler, Flux2KleinPipeline, Flux2Transformer2DModel
+from diffusers.optimization import get_scheduler
+from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
+
+from publicdataset import CommonCatalogDataset
+
+
+DEFAULT_TEACHER = "black-forest-labs/FLUX.2-klein-base-4B"
+CHECKPOINT_PATTERN = re.compile(r"checkpoint-(\d+)$")
+
+
+class CachedFlux2Dataset(Dataset):
+    def __init__(self, cache_dir):
+        self.cache_dir = Path(cache_dir)
+        self.samples = []
+        for sample_dir in sorted(path for path in self.cache_dir.iterdir() if path.is_dir()):
+            latent_path = self._first_existing(sample_dir, ("latent.pt", "image_latent.pt"))
+            embedding_path = self._first_existing(sample_dir, ("embedding.pt", "text_embedding.pt"))
+            if latent_path is not None and embedding_path is not None:
+                self.samples.append((sample_dir, latent_path, embedding_path))
+        if not self.samples:
+            raise ValueError(
+                f"No cached samples found in {self.cache_dir}. Each sample directory must contain "
+                "latent.pt and embedding.pt."
+            )
+
+    @staticmethod
+    def _first_existing(directory, names):
+        for name in names:
+            path = directory / name
+            if path.is_file():
+                return path
+        return None
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        sample_dir, latent_path, embedding_path = self.samples[index]
+        latent = torch.load(latent_path, map_location="cpu", weights_only=True)
+        embedding = torch.load(embedding_path, map_location="cpu", weights_only=True)
+        if latent.ndim == 4 and latent.shape[0] == 1:
+            latent = latent[0]
+        if embedding.ndim == 3 and embedding.shape[0] == 1:
+            embedding = embedding[0]
+        if latent.ndim != 3:
+            raise ValueError(f"{latent_path} must have shape (C,H,W), got {tuple(latent.shape)}")
+        if embedding.ndim != 2:
+            raise ValueError(f"{embedding_path} must have shape (L,D), got {tuple(embedding.shape)}")
+        prompt_path = sample_dir / "prompt.txt"
+        return {
+            "latent": latent,
+            "embedding": embedding,
+            "prompt": prompt_path.read_text(encoding="utf-8") if prompt_path.is_file() else "",
+        }
+
+
+def collate_cached_samples(examples):
+    latent_shapes = {tuple(example["latent"].shape) for example in examples}
+    embedding_shapes = {tuple(example["embedding"].shape) for example in examples}
+    if len(latent_shapes) != 1:
+        raise ValueError(f"A batch contains different latent shapes: {sorted(latent_shapes)}")
+    if len(embedding_shapes) != 1:
+        raise ValueError(f"A batch contains different embedding shapes: {sorted(embedding_shapes)}")
+    return {
+        "latents": torch.stack([example["latent"] for example in examples]),
+        "embeddings": torch.stack([example["embedding"] for example in examples]),
+        "prompts": [example["prompt"] for example in examples],
+    }
+
+
+def collate_public_samples(examples):
+    return {
+        "images": [example["image"] for example in examples],
+        "captions": [example["caption"] for example in examples],
+        "source_files": [example["source_file"] for example in examples],
+    }
+
+
+def preprocess_public_images(images, resolution):
+    tensors = []
+    for image in images:
+        image = image.convert("RGB")
+        scale = resolution / min(image.size)
+        resized = (
+            max(resolution, round(image.width * scale)),
+            max(resolution, round(image.height * scale)),
+        )
+        image = image.resize(resized, resample=Image.Resampling.LANCZOS)
+        left = (image.width - resolution) // 2
+        top = (image.height - resolution) // 2
+        image = image.crop((left, top, left + resolution, top + resolution))
+        array = np.asarray(image, dtype=np.float32).copy()
+        tensors.append(torch.from_numpy(array).permute(2, 0, 1) / 127.5 - 1.0)
+    return torch.stack(tensors)
+
+
+def load_public_encoding_pipeline(args, dtype, device):
+    pipeline = Flux2KleinPipeline.from_pretrained(
+        args.teacher_model,
+        transformer=None,
+        scheduler=None,
+        dtype=dtype,
+        revision=args.revision,
+        local_files_only=args.local_files_only,
+    )
+    pipeline.vae.eval().requires_grad_(False).to(device=device)
+    pipeline.text_encoder.eval().requires_grad_(False).to(device=device)
+    return pipeline
+
+
+@torch.no_grad()
+def encode_public_batch(pipeline, batch, resolution, device, dtype):
+    pixel_values = preprocess_public_images(batch["images"], resolution).to(device=device, dtype=dtype)
+    latents = pipeline.vae.encode(pixel_values).latent_dist.mode()
+    latents = Flux2KleinPipeline._patchify_latents(latents)
+    mean = pipeline.vae.bn.running_mean.view(1, -1, 1, 1).to(latents.device, latents.dtype)
+    variance = pipeline.vae.bn.running_var.view(1, -1, 1, 1).to(latents.device, latents.dtype)
+    std = torch.sqrt(variance + pipeline.vae.bn.eps)
+    latents = (latents - mean) / std
+    prompt_embeds, _ = pipeline.encode_prompt(prompt=batch["captions"], device=device)
+    return latents.to(dtype=dtype), prompt_embeds.to(dtype=dtype)
+
+
+@torch.no_grad()
+def load_public_validation_samples(args, pipeline, dtype, device):
+    root_dir = args.validation_public_dataset_root or args.public_dataset_root
+    dataset = CommonCatalogDataset(
+        root_dir=root_dir,
+        image_key=args.public_image_key,
+        caption_key=args.public_caption_key,
+        fallback_caption_key=args.public_fallback_caption_key,
+        batch_size=args.public_parquet_batch_size,
+        skip_broken_files=True,
+    )
+    samples = []
+    captions = []
+    for sample in dataset:
+        captions.append(sample["caption"])
+        if len(captions) == args.num_validation_images:
+            break
+    if not captions:
+        raise ValueError(f"No valid CommonCatalog validation samples found in {root_dir}")
+    embeddings, _ = pipeline.encode_prompt(prompt=captions, device=device)
+    for caption, embedding in zip(captions, embeddings):
+        samples.append({"embedding": embedding.to(device="cpu", dtype=dtype), "prompt": caption})
+    return samples
+
+
+def evenly_spaced_indices(teacher_count, student_count):
+    if student_count < 1 or student_count > teacher_count:
+        raise ValueError(f"student_count must be between 1 and {teacher_count}, got {student_count}")
+    if student_count == 1:
+        return [0]
+    return [round(index * (teacher_count - 1) / (student_count - 1)) for index in range(student_count)]
+
+
+def reset_parameters(model):
+    for module in model.modules():
+        reset = getattr(module, "reset_parameters", None)
+        if callable(reset):
+            reset()
+
+
+def initialize_student_from_teacher(student, teacher):
+    shared_modules = (
+        "time_guidance_embed",
+        "double_stream_modulation_img",
+        "double_stream_modulation_txt",
+        "single_stream_modulation",
+        "x_embedder",
+        "context_embedder",
+        "norm_out",
+        "proj_out",
+    )
+    for name in shared_modules:
+        getattr(student, name).load_state_dict(getattr(teacher, name).state_dict())
+
+    double_indices = evenly_spaced_indices(len(teacher.transformer_blocks), len(student.transformer_blocks))
+    for student_index, teacher_index in enumerate(double_indices):
+        student.transformer_blocks[student_index].load_state_dict(
+            teacher.transformer_blocks[teacher_index].state_dict()
+        )
+
+    single_indices = evenly_spaced_indices(
+        len(teacher.single_transformer_blocks), len(student.single_transformer_blocks)
+    )
+    for student_index, teacher_index in enumerate(single_indices):
+        student.single_transformer_blocks[student_index].load_state_dict(
+            teacher.single_transformer_blocks[teacher_index].state_dict()
+        )
+    return double_indices, single_indices
+
+
+def build_student(teacher, num_layers, num_single_layers, random_init, device):
+    config = dict(teacher.config)
+    config["num_layers"] = num_layers
+    config["num_single_layers"] = num_single_layers
+    with torch.device("meta"):
+        student = Flux2Transformer2DModel.from_config(config)
+    student.to_empty(device=device)
+    reset_parameters(student)
+    mapping = None
+    if not random_init:
+        mapping = initialize_student_from_teacher(student, teacher)
+    return student, mapping
+
+
+def count_parameters(model):
+    return sum(parameter.numel() for parameter in model.parameters())
+
+
+def resolve_latest_checkpoint(output_dir):
+    checkpoints = []
+    for path in output_dir.glob("checkpoint-*"):
+        match = CHECKPOINT_PATTERN.fullmatch(path.name)
+        if path.is_dir() and match:
+            checkpoints.append((int(match.group(1)), path))
+    return max(checkpoints, default=(None, None))[1]
+
+
+def register_accelerator_hooks(accelerator):
+    def save_model_hook(models, weights, output_dir):
+        for model in models:
+            unwrapped = accelerator.unwrap_model(model)
+            if not isinstance(unwrapped, Flux2Transformer2DModel):
+                raise ValueError(f"Unexpected model in checkpoint: {type(unwrapped).__name__}")
+            if accelerator.is_main_process:
+                state_dict = accelerator.get_state_dict(model)
+                unwrapped.save_pretrained(
+                    Path(output_dir) / "transformer",
+                    state_dict=state_dict,
+                    safe_serialization=True,
+                )
+            if weights:
+                weights.pop()
+
+    def load_model_hook(models, input_dir):
+        while models:
+            model = models.pop()
+            unwrapped = accelerator.unwrap_model(model)
+            loaded = Flux2Transformer2DModel.from_pretrained(
+                input_dir,
+                subfolder="transformer",
+                dtype=torch.float32,
+                local_files_only=True,
+            )
+            unwrapped.register_to_config(**dict(loaded.config))
+            unwrapped.load_state_dict(loaded.state_dict())
+            del loaded
+
+    accelerator.register_save_state_pre_hook(save_model_hook)
+    accelerator.register_load_state_pre_hook(load_model_hook)
+
+
+def validate_cache_shapes(dataset, teacher):
+    sample = dataset[0]
+    latent = sample["latent"]
+    embedding = sample["embedding"]
+    if latent.shape[0] != teacher.config.in_channels:
+        raise ValueError(
+            f"Cached latent has {latent.shape[0]} channels, but the transformer expects "
+            f"{teacher.config.in_channels}. Cache the normalized, patchified FLUX.2 VAE latent."
+        )
+    if embedding.shape[-1] != teacher.config.joint_attention_dim:
+        raise ValueError(
+            f"Cached embedding has dimension {embedding.shape[-1]}, but the transformer expects "
+            f"{teacher.config.joint_attention_dim}."
+        )
+
+
+def get_sigmas(scheduler, indices, latent_ndim, device, dtype):
+    sigmas = scheduler.sigmas.to(device=device, dtype=dtype)[indices]
+    while sigmas.ndim < latent_ndim:
+        sigmas = sigmas.unsqueeze(-1)
+    return sigmas
+
+
+def transformer_prediction(model, noisy_latents, prompt_embeds, timesteps, guidance_scale):
+    packed_latents = Flux2KleinPipeline._pack_latents(noisy_latents)
+    image_ids = Flux2KleinPipeline._prepare_latent_ids(noisy_latents).to(noisy_latents.device)
+    text_ids = Flux2KleinPipeline._prepare_text_ids(prompt_embeds).to(noisy_latents.device)
+    guidance = None
+    model_config = model.module.config if hasattr(model, "module") else model.config
+    if model_config.guidance_embeds:
+        guidance = torch.full(
+            (noisy_latents.shape[0],), guidance_scale, device=noisy_latents.device, dtype=noisy_latents.dtype
+        )
+    prediction = model(
+        hidden_states=packed_latents,
+        encoder_hidden_states=prompt_embeds,
+        timestep=timesteps / 1000,
+        img_ids=image_ids,
+        txt_ids=text_ids,
+        guidance=guidance,
+        return_dict=False,
+    )[0]
+    return prediction[:, : packed_latents.shape[1]]
+
+
+def weighted_mse(prediction, target, weights):
+    per_sample = (prediction.float() - target.float()).pow(2).flatten(1).mean(1)
+    return (per_sample * weights.float().flatten()).mean()
+
+
+def load_validation_pipeline(args, transformer, dtype, device):
+    pipeline = Flux2KleinPipeline.from_pretrained(
+        args.teacher_model,
+        transformer=transformer,
+        text_encoder=None,
+        tokenizer=None,
+        dtype=dtype,
+        revision=args.revision,
+        local_files_only=args.local_files_only,
+    )
+    pipeline.vae.to(device=device)
+    pipeline.set_progress_bar_config(disable=True)
+    return pipeline
+
+
+@torch.no_grad()
+def load_validation_negative_prompt_embeds(args, dtype, device, text_pipeline=None):
+    if args.validation_guidance_scale <= 1:
+        return None
+    if args.validation_negative_prompt_embeds:
+        path = Path(args.validation_negative_prompt_embeds)
+        embeds = torch.load(path, map_location="cpu", weights_only=True)
+        if embeds.ndim == 2:
+            embeds = embeds.unsqueeze(0)
+        if embeds.ndim != 3:
+            raise ValueError(f"{path} must have shape (L,D) or (1,L,D), got {tuple(embeds.shape)}")
+        return embeds.to(dtype=dtype)
+
+    owns_pipeline = text_pipeline is None
+    if owns_pipeline:
+        text_pipeline = Flux2KleinPipeline.from_pretrained(
+            args.teacher_model,
+            transformer=None,
+            vae=None,
+            scheduler=None,
+            dtype=dtype,
+            revision=args.revision,
+            local_files_only=args.local_files_only,
+        )
+        text_pipeline.text_encoder.to(device=device)
+    negative_prompt_embeds, _ = text_pipeline.encode_prompt(prompt="", device=device)
+    negative_prompt_embeds = negative_prompt_embeds.to(device="cpu", dtype=dtype)
+    if owns_pipeline:
+        text_pipeline.text_encoder.to(device="cpu")
+        del text_pipeline
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return negative_prompt_embeds
+
+
+@torch.no_grad()
+def generate_validation_images(
+    accelerator,
+    pipeline,
+    transformer,
+    samples,
+    negative_prompt_embeds,
+    args,
+    dtype,
+):
+    if args.validation_guidance_scale > 1 and negative_prompt_embeds is None:
+        raise ValueError("CFG validation requires an empty negative-prompt embedding")
+    previous_transformer = pipeline.transformer
+    pipeline.transformer = transformer
+    was_training = transformer.training
+    transformer.eval()
+    images = []
+    for index, sample in enumerate(samples):
+        prompt_embeds = sample["embedding"].unsqueeze(0).to(accelerator.device, dtype=dtype)
+        negative_embeds = None
+        if negative_prompt_embeds is not None:
+            negative_embeds = negative_prompt_embeds.to(accelerator.device, dtype=dtype)
+        generator = torch.Generator(device=accelerator.device).manual_seed(args.validation_seed + index)
+        pipeline_args = {
+            "prompt_embeds": prompt_embeds,
+            "negative_prompt_embeds": negative_embeds,
+            "guidance_scale": args.validation_guidance_scale,
+            "num_inference_steps": args.validation_num_inference_steps,
+            "generator": generator,
+            "output_type": "pil",
+        }
+        if args.validation_height is not None:
+            pipeline_args["height"] = args.validation_height
+            pipeline_args["width"] = args.validation_width
+        with accelerator.autocast():
+            image = pipeline(**pipeline_args).images[0]
+        images.append(image)
+    transformer.train(was_training)
+    pipeline.transformer = previous_transformer
+    return images
+
+
+def log_validation_images(accelerator, tag, images, samples, args, step):
+    tracker = next((tracker for tracker in accelerator.trackers if tracker.name == "tensorboard"), None)
+    if tracker is not None:
+        tracker.writer.add_images(
+            tag,
+            np.stack([np.asarray(image) for image in images]),
+            global_step=step,
+            dataformats="NHWC",
+        )
+
+    tag_name = tag.replace("/", "-")
+    validation_dir = Path(args.output_dir) / "validation" / f"step-{step:08d}"
+    validation_dir.mkdir(parents=True, exist_ok=True)
+    metadata = []
+    for index, (image, sample) in enumerate(zip(images, samples)):
+        seed = args.validation_seed + index
+        filename = f"{tag_name}-{index:03d}-seed-{seed}.png"
+        image.save(validation_dir / filename)
+        metadata.append(
+            {
+                "file": filename,
+                "prompt": sample["prompt"],
+                "seed": seed,
+                "guidance_scale": args.validation_guidance_scale,
+                "num_inference_steps": args.validation_num_inference_steps,
+                "width": image.width,
+                "height": image.height,
+            }
+        )
+    (validation_dir / f"{tag_name}.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    accelerator.print(f"Saved {tag} validation images: {validation_dir}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    data_source = parser.add_mutually_exclusive_group(required=True)
+    data_source.add_argument("--cache_dir")
+    data_source.add_argument("--public_dataset_root")
+    parser.add_argument("--validation_cache_dir")
+    parser.add_argument("--validation_public_dataset_root")
+    parser.add_argument("--public_image_key", default="jpg")
+    parser.add_argument("--public_caption_key", default="blip2_caption")
+    parser.add_argument("--public_fallback_caption_key", default="caption")
+    parser.add_argument("--public_parquet_batch_size", type=int, default=64)
+    parser.add_argument("--public_resolution", type=int, default=512)
+    parser.add_argument("--teacher_model", default=DEFAULT_TEACHER)
+    parser.add_argument("--revision")
+    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--student_num_layers", type=int, default=2)
+    parser.add_argument("--student_num_single_layers", type=int, default=3)
+    parser.add_argument("--random_init", action="store_true")
+    parser.add_argument("--train_batch_size", type=int, default=1)
+    parser.add_argument("--dataloader_num_workers", type=int, default=4)
+    parser.add_argument("--max_train_steps", type=int, default=50000)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--lr_scheduler", default="constant_with_warmup")
+    parser.add_argument("--lr_warmup_steps", type=int, default=500)
+    parser.add_argument("--adam_beta1", type=float, default=0.9)
+    parser.add_argument("--adam_beta2", type=float, default=0.999)
+    parser.add_argument("--adam_weight_decay", type=float, default=1e-2)
+    parser.add_argument("--adam_epsilon", type=float, default=1e-8)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--lambda_gt", type=float, default=1.0)
+    parser.add_argument("--lambda_kd", type=float, default=1.0)
+    parser.add_argument(
+        "--weighting_scheme",
+        choices=("none", "logit_normal", "mode", "sigma_sqrt", "cosmap"),
+        default="none",
+    )
+    parser.add_argument("--logit_mean", type=float, default=0.0)
+    parser.add_argument("--logit_std", type=float, default=1.0)
+    parser.add_argument("--mode_scale", type=float, default=1.29)
+    parser.add_argument("--guidance_scale", type=float, default=1.0)
+    parser.add_argument("--mixed_precision", choices=("no", "fp16", "bf16"), default="bf16")
+    parser.add_argument("--allow_tf32", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--checkpointing_steps", type=int, default=1000)
+    parser.add_argument("--resume_from_checkpoint")
+    parser.add_argument("--report_to", choices=("tensorboard", "none"), default="tensorboard")
+    parser.add_argument("--logging_dir", default="logs")
+    parser.add_argument("--validation_epochs", type=int, default=0)
+    parser.add_argument("--validation_steps", type=int, default=0)
+    parser.add_argument("--num_validation_images", type=int, default=4)
+    parser.add_argument("--validation_num_inference_steps", type=int, default=50)
+    parser.add_argument("--validation_guidance_scale", type=float, default=4.0)
+    parser.add_argument("--validation_seed", type=int, default=0)
+    parser.add_argument("--validation_height", type=int)
+    parser.add_argument("--validation_width", type=int)
+    parser.add_argument("--validation_negative_prompt_embeds")
+    model_source = parser.add_mutually_exclusive_group()
+    model_source.add_argument("--local_files_only", dest="local_files_only", action="store_true")
+    model_source.add_argument("--allow_download", dest="local_files_only", action="store_false")
+    parser.set_defaults(local_files_only=True)
+    parser.add_argument("--skip_final_save", action="store_true")
+    args = parser.parse_args()
+    if args.max_train_steps < 1:
+        parser.error("--max_train_steps must be at least 1")
+    if args.public_resolution < 16 or args.public_resolution % 16:
+        parser.error("--public_resolution must be a positive multiple of 16")
+    if args.public_dataset_root and args.validation_epochs > 0 and args.validation_steps == 0:
+        parser.error("CommonCatalog streaming mode uses --validation_steps instead of --validation_epochs")
+    if args.lambda_gt < 0 or args.lambda_kd < 0 or args.lambda_gt + args.lambda_kd == 0:
+        parser.error("At least one non-negative loss weight must be greater than zero")
+    if (args.validation_height is None) != (args.validation_width is None):
+        parser.error("--validation_height and --validation_width must be specified together")
+    if args.validation_height is not None and (args.validation_height < 16 or args.validation_width < 16):
+        parser.error("Validation height and width must be at least 16")
+    return args
+
+
+def main():
+    args = parse_args()
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    logging_dir = output_dir / args.logging_dir
+    project_config = ProjectConfiguration(project_dir=output_dir, logging_dir=logging_dir)
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision=args.mixed_precision,
+        log_with=None if args.report_to == "none" else args.report_to,
+        project_config=project_config,
+    )
+    set_seed(args.seed, device_specific=True)
+
+    if args.allow_tf32 and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
+    is_public_dataset = args.public_dataset_root is not None
+    if is_public_dataset:
+        dataset = CommonCatalogDataset(
+            root_dir=args.public_dataset_root,
+            image_key=args.public_image_key,
+            caption_key=args.public_caption_key,
+            fallback_caption_key=args.public_fallback_caption_key,
+            batch_size=args.public_parquet_batch_size,
+            skip_broken_files=True,
+            process_index=accelerator.process_index,
+            num_processes=accelerator.num_processes,
+        )
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.train_batch_size,
+            num_workers=args.dataloader_num_workers,
+            pin_memory=False,
+            drop_last=True,
+            collate_fn=collate_public_samples,
+            persistent_workers=args.dataloader_num_workers > 0,
+        )
+    else:
+        dataset = CachedFlux2Dataset(args.cache_dir)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.train_batch_size,
+            shuffle=True,
+            num_workers=args.dataloader_num_workers,
+            pin_memory=True,
+            drop_last=True,
+            collate_fn=collate_cached_samples,
+            persistent_workers=args.dataloader_num_workers > 0,
+        )
+        if len(dataloader) == 0:
+            raise ValueError(
+                f"The training dataloader is empty: dataset_size={len(dataset)}, "
+                f"train_batch_size={args.train_batch_size}. Reduce --train_batch_size or add cache samples."
+            )
+
+    noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+        args.teacher_model,
+        subfolder="scheduler",
+        revision=args.revision,
+        local_files_only=args.local_files_only,
+    )
+    teacher = Flux2Transformer2DModel.from_pretrained(
+        args.teacher_model,
+        subfolder="transformer",
+        revision=args.revision,
+        dtype=weight_dtype,
+        local_files_only=args.local_files_only,
+    )
+    teacher.to(accelerator.device)
+    teacher.eval().requires_grad_(False)
+    pipeline_config = Flux2KleinPipeline.load_config(
+        args.teacher_model,
+        revision=args.revision,
+        local_files_only=args.local_files_only,
+    )
+    if pipeline_config.get("is_distilled", False):
+        raise ValueError(
+            "Capacity distillation requires FLUX.2-klein-base-4B, not the step-distilled FLUX.2-klein-4B"
+        )
+    if teacher.config.guidance_embeds:
+        raise ValueError("FLUX.2 Klein base teacher must have guidance_embeds=False")
+    if not is_public_dataset:
+        validate_cache_shapes(dataset, teacher)
+
+    student, mapping = build_student(
+        teacher,
+        args.student_num_layers,
+        args.student_num_single_layers,
+        args.random_init,
+        accelerator.device,
+    )
+    if args.gradient_checkpointing:
+        student.enable_gradient_checkpointing()
+
+    public_encoding_pipeline = None
+    if is_public_dataset:
+        public_encoding_pipeline = load_public_encoding_pipeline(
+            args, weight_dtype, accelerator.device
+        )
+
+    optimizer = torch.optim.AdamW(
+        student.parameters(),
+        lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
+    )
+    lr_scheduler = get_scheduler(
+        args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
+        num_training_steps=args.max_train_steps * accelerator.num_processes,
+    )
+
+    student, optimizer, lr_scheduler = accelerator.prepare(student, optimizer, lr_scheduler)
+    if not is_public_dataset:
+        dataloader = accelerator.prepare(dataloader)
+    register_accelerator_hooks(accelerator)
+
+    if accelerator.is_main_process:
+        accelerator.init_trackers("flux2-capacity-distillation", config=vars(args))
+        teacher_parameters = count_parameters(teacher)
+        student_parameters = count_parameters(accelerator.unwrap_model(student))
+        print(f"Teacher parameters: {teacher_parameters:,} ({teacher_parameters / 1e9:.3f}B)")
+        print(f"Student parameters: {student_parameters:,} ({student_parameters / 1e9:.3f}B)")
+        if mapping is not None:
+            print(f"Teacher layer mapping: double={mapping[0]}, single={mapping[1]}")
+        data_mode = (
+            f"CommonCatalog streaming: {args.public_dataset_root}"
+            if is_public_dataset
+            else f"cache: {args.cache_dir}"
+        )
+        print(f"Training data mode: {data_mode}")
+        global_batch_size = (
+            args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+        )
+        print(f"Global batch size: {global_batch_size}")
+
+    global_step = 0
+    resume_path = None
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint == "latest":
+            resume_path = resolve_latest_checkpoint(output_dir)
+        else:
+            resume_path = Path(args.resume_from_checkpoint)
+        if resume_path is None or not resume_path.is_dir():
+            raise ValueError(f"Checkpoint not found: {args.resume_from_checkpoint}")
+        accelerator.load_state(resume_path)
+        match = CHECKPOINT_PATTERN.fullmatch(resume_path.name)
+        if match is None:
+            raise ValueError(f"Checkpoint directory must be named checkpoint-<step>: {resume_path}")
+        global_step = int(match.group(1))
+        accelerator.print(f"Resumed complete training state from {resume_path} at step {global_step}")
+
+    validation_samples = None
+    validation_pipeline = None
+    validation_negative_prompt_embeds = None
+    validation_enabled = args.validation_epochs > 0 or args.validation_steps > 0
+    if validation_enabled:
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            if args.validation_cache_dir or not is_public_dataset:
+                validation_dataset = CachedFlux2Dataset(args.validation_cache_dir or args.cache_dir)
+                validation_samples = [
+                    validation_dataset[index]
+                    for index in range(min(args.num_validation_images, len(validation_dataset)))
+                ]
+            else:
+                validation_samples = load_public_validation_samples(
+                    args, public_encoding_pipeline, weight_dtype, accelerator.device
+                )
+            validation_pipeline = load_validation_pipeline(
+                args, accelerator.unwrap_model(student), weight_dtype, accelerator.device
+            )
+            validation_negative_prompt_embeds = load_validation_negative_prompt_embeds(
+                args,
+                weight_dtype,
+                accelerator.device,
+                text_pipeline=public_encoding_pipeline,
+            )
+            teacher_images = generate_validation_images(
+                accelerator,
+                validation_pipeline,
+                teacher,
+                validation_samples,
+                validation_negative_prompt_embeds,
+                args,
+                weight_dtype,
+            )
+            log_validation_images(
+                accelerator, "validation/teacher", teacher_images, validation_samples, args, 0
+            )
+        accelerator.wait_for_everyone()
+
+    progress_bar = tqdm(
+        range(global_step, args.max_train_steps),
+        disable=not accelerator.is_local_main_process,
+        desc="Steps",
+    )
+
+    epoch = 0
+    while global_step < args.max_train_steps:
+        student.train()
+        batches_this_pass = 0
+        for batch in dataloader:
+            batches_this_pass += 1
+            with accelerator.accumulate(student):
+                if is_public_dataset:
+                    model_input, prompt_embeds = encode_public_batch(
+                        public_encoding_pipeline,
+                        batch,
+                        args.public_resolution,
+                        accelerator.device,
+                        weight_dtype,
+                    )
+                else:
+                    model_input = batch["latents"].to(
+                        accelerator.device, dtype=weight_dtype, non_blocking=True
+                    )
+                    prompt_embeds = batch["embeddings"].to(
+                        accelerator.device, dtype=weight_dtype, non_blocking=True
+                    )
+                noise = torch.randn_like(model_input)
+                batch_size = model_input.shape[0]
+                timestep_density = compute_density_for_timestep_sampling(
+                    weighting_scheme=args.weighting_scheme,
+                    batch_size=batch_size,
+                    logit_mean=args.logit_mean,
+                    logit_std=args.logit_std,
+                    mode_scale=args.mode_scale,
+                    device=accelerator.device,
+                )
+                timestep_indices = (
+                    timestep_density * noise_scheduler.config.num_train_timesteps
+                ).long().clamp(max=noise_scheduler.config.num_train_timesteps - 1)
+                timesteps = noise_scheduler.timesteps.to(accelerator.device)[timestep_indices]
+                sigmas = get_sigmas(
+                    noise_scheduler,
+                    timestep_indices,
+                    model_input.ndim,
+                    accelerator.device,
+                    model_input.dtype,
+                )
+                noisy_model_input = (1 - sigmas) * model_input + sigmas * noise
+                packed_target = Flux2KleinPipeline._pack_latents(noise - model_input)
+
+                with torch.no_grad(), accelerator.autocast():
+                    teacher_prediction = transformer_prediction(
+                        teacher, noisy_model_input, prompt_embeds, timesteps, args.guidance_scale
+                    )
+
+                student_prediction = transformer_prediction(
+                    student, noisy_model_input, prompt_embeds, timesteps, args.guidance_scale
+                )
+                loss_weights = compute_loss_weighting_for_sd3(
+                    weighting_scheme=args.weighting_scheme,
+                    sigmas=sigmas,
+                )
+                loss_gt = weighted_mse(student_prediction, packed_target, loss_weights)
+                loss_kd = weighted_mse(student_prediction, teacher_prediction, loss_weights)
+                teacher_gt = weighted_mse(teacher_prediction, packed_target, loss_weights)
+                loss = args.lambda_gt * loss_gt + args.lambda_kd * loss_kd
+
+                if not torch.isfinite(loss):
+                    raise RuntimeError(
+                        f"Non-finite loss at step {global_step}: total={loss.item()}, "
+                        f"gt={loss_gt.item()}, kd={loss_kd.item()}"
+                    )
+
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(student.parameters(), args.max_grad_norm)
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            if accelerator.sync_gradients:
+                global_step += 1
+                progress_bar.update(1)
+                logs = {
+                    "train/loss": loss.detach().item(),
+                    "train/loss_gt": loss_gt.detach().item(),
+                    "train/loss_kd": loss_kd.detach().item(),
+                    "train/teacher_gt": teacher_gt.detach().item(),
+                    "train/lr": lr_scheduler.get_last_lr()[0],
+                    "train/epoch": epoch + 1,
+                }
+                progress_bar.set_postfix(loss=f"{logs['train/loss']:.4f}", kd=f"{logs['train/loss_kd']:.4f}")
+                accelerator.log(logs, step=global_step)
+
+                if args.checkpointing_steps and global_step % args.checkpointing_steps == 0:
+                    save_path = output_dir / f"checkpoint-{global_step}"
+                    accelerator.save_state(save_path)
+                    accelerator.print(f"Saved checkpoint: {save_path}")
+
+                if args.validation_steps > 0 and global_step % args.validation_steps == 0:
+                    accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        student_images = generate_validation_images(
+                            accelerator,
+                            validation_pipeline,
+                            accelerator.unwrap_model(student),
+                            validation_samples,
+                            validation_negative_prompt_embeds,
+                            args,
+                            weight_dtype,
+                        )
+                        log_validation_images(
+                            accelerator,
+                            "validation/student",
+                            student_images,
+                            validation_samples,
+                            args,
+                            global_step,
+                        )
+                    accelerator.wait_for_everyone()
+
+            if global_step >= args.max_train_steps:
+                break
+
+        if batches_this_pass == 0:
+            raise RuntimeError("CommonCatalog produced no valid batches; check the parquet root and column names")
+
+        if not is_public_dataset and args.validation_epochs > 0 and (epoch + 1) % args.validation_epochs == 0:
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                student_images = generate_validation_images(
+                    accelerator,
+                    validation_pipeline,
+                    accelerator.unwrap_model(student),
+                    validation_samples,
+                    validation_negative_prompt_embeds,
+                    args,
+                    weight_dtype,
+                )
+                log_validation_images(
+                    accelerator,
+                    "validation/student",
+                    student_images,
+                    validation_samples,
+                    args,
+                    global_step,
+                )
+            accelerator.wait_for_everyone()
+
+        epoch += 1
+
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process and not args.skip_final_save:
+        final_dir = output_dir / "student"
+        state_dict = accelerator.get_state_dict(student)
+        accelerator.unwrap_model(student).save_pretrained(
+            final_dir,
+            state_dict=state_dict,
+            safe_serialization=True,
+        )
+        (output_dir / "training_args.json").write_text(
+            json.dumps(vars(args), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(f"Saved final Diffusers transformer: {final_dir}")
+    accelerator.end_training()
+
+
+if __name__ == "__main__":
+    main()
