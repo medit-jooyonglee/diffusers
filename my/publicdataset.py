@@ -13,6 +13,12 @@ def decode_caption(text: str) -> str:
         return ""
     return unquote_plus(text).strip()
 
+"""_summary_
+
+commoncatalog-cc-by dataset
+nohup hf download common-canvas/commoncatalog-cc-by --repo-type dataset --include "*/least_dim_range=512-768/*.parquet" --local-dir /data1/jooyonglee/commoncatalog-cc-by > logs/commondata.log 2>&1 &
+nohup hf download common-canvas/commoncatalog-cc-by --repo-type dataset --include "*/least_dim_range=768-1024/*.parquet" --local-dir /data1/jooyonglee/commoncatalog-cc-by > logs/com_768_1024.log 2>&1 &
+"""
 
 class CommonCatalogDataset(IterableDataset):
     def __init__(
@@ -25,6 +31,7 @@ class CommonCatalogDataset(IterableDataset):
         skip_broken_files=True,
         process_index=0,
         num_processes=1,
+        max_samples=None,
     ):
         super().__init__()
 
@@ -36,6 +43,7 @@ class CommonCatalogDataset(IterableDataset):
         self.skip_broken_files = skip_broken_files
         self.process_index = process_index
         self.num_processes = num_processes
+        self.max_samples = max_samples
         if not 0 <= process_index < num_processes:
             raise ValueError(
                 f"process_index must be in [0, {num_processes}), got {process_index}"
@@ -85,6 +93,14 @@ class CommonCatalogDataset(IterableDataset):
         shard_index = self.process_index * num_workers + worker_id
         num_shards = self.num_processes * num_workers
         files = self.files[shard_index::num_shards]
+        shard_limit = None
+        if self.max_samples is not None:
+            process_limit = self.max_samples // self.num_processes
+            shard_limit = process_limit // num_workers
+            shard_limit += int(worker_id < process_limit % num_workers)
+        yielded = 0
+        if shard_limit == 0:
+            return
 
         for parquet_path in files:
 
@@ -138,6 +154,9 @@ class CommonCatalogDataset(IterableDataset):
                                 "caption": caption,
                                 "source_file": parquet_path,
                             }
+                            yielded += 1
+                            if shard_limit is not None and yielded >= shard_limit:
+                                return
 
                         except Exception as e:
                             print(
@@ -158,8 +177,7 @@ class CommonCatalogDataset(IterableDataset):
                 continue
 
 
-if __name__ == "__main__":
-
+def main_dataload():
     root = "/data1/jooyonglee/commoncatalog-cc-by/0/least_dim_range=512-768/"
 
     dataset = CommonCatalogDataset(
@@ -194,3 +212,63 @@ if __name__ == "__main__":
 
         if idx >= 20:
             break
+        
+        
+def prompt_saving(
+    base_root='',
+    num_save=200,
+    save_path='my/samples/commoncatalog'
+):
+    
+    base_root = base_root or "/data1/jooyonglee/commoncatalog-cc-by/0/least_dim_range=512-768/"
+
+    dataset = CommonCatalogDataset(
+        root_dir=base_root,
+        image_key="jpg",
+        caption_key="blip2_caption",
+        fallback_caption_key="caption",
+        batch_size=64,
+        skip_broken_files=True,
+    )
+    
+    loader = DataLoader(
+        dataset,
+        batch_size=None,
+        num_workers=0,  # 먼저 0으로 검증
+    )
+
+
+
+    prompts = []
+    num_sample = 500
+    for idx, sample in enumerate(loader):
+        if idx >= num_sample:
+            break
+        image = sample["image"]
+        caption = sample["caption"]
+
+        # print(
+        #     f"[{idx}] "
+        #     f"size={image.size} "
+        #     f"caption={caption[:120]}"
+        # )
+        prompts.append(caption)
+
+    
+    
+    save_filename = os.path.join(save_path, "prompts.txt")
+    os.makedirs(save_path, exist_ok=True)
+    with open(save_filename, 'w', encoding='utf-8') as f:
+        f.writelines(line + "\n" for line in prompts)
+    print(f"Prompts saved to {save_filename}")
+        
+        # if idx == 0:
+        # image.save(f"outputs/test_commoncatalog{idx}.jpg")
+
+        # if idx >= 20:
+            # break
+        
+    
+if __name__ == "__main__":
+    prompt_saving()
+    # main_dataload()

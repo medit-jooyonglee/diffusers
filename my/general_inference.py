@@ -155,7 +155,15 @@ def parse_args() -> argparse.Namespace:
     )
 
     generation = parser.add_argument_group("generation")
-    generation.add_argument("--num-images", type=positive_int, default=5, help="Total number of images to create.")
+    generation.add_argument(
+        "--num-images",
+        type=nonzero_int,
+        default=5,
+        help=(
+            "Positive values create this many images with incrementing seeds. A negative value creates one image "
+            "per input prompt and reuses the exact --seed for every image."
+        ),
+    )
     generation.add_argument("--batch-size", type=positive_int, default=1, help="Images generated in one pipeline call.")
     generation.add_argument("--output-dir", type=Path, default=Path("outputs/general_inference"))
     generation.add_argument("--filename-prefix", default="image")
@@ -192,6 +200,13 @@ def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def nonzero_int(value: str) -> int:
+    parsed = int(value)
+    if parsed == 0:
+        raise argparse.ArgumentTypeError("must not be zero")
     return parsed
 
 
@@ -476,6 +491,23 @@ def supports_call_argument(pipe: Any, name: str) -> bool:
     return name in inspect.signature(pipe.__call__).parameters
 
 
+def prepare_negative_prompt_kwargs(pipe: Any, prompts: list[str]) -> dict[str, Any]:
+    if supports_call_argument(pipe, "negative_prompt"):
+        return {"negative_prompt": prompts}
+    if supports_call_argument(pipe, "negative_prompt_embeds") and any(prompts):
+        import torch
+
+        with torch.inference_mode():
+            encoded = pipe.encode_prompt(
+                prompt=prompts,
+                device=pipe._execution_device,
+                num_images_per_prompt=1,
+            )
+        prompt_embeds = encoded[0] if isinstance(encoded, tuple) else encoded
+        return {"negative_prompt_embeds": prompt_embeds}
+    return {}
+
+
 def ensure_clip_skip_compatibility(pipe: Any) -> None:
     """Bridge the flattened CLIPTextModel layout used by Transformers 5.x.
 
@@ -513,21 +545,30 @@ def main() -> None:
         return
     if not args.lora and (args.lora_scale or args.lora_weight_name or args.lora_adapter_name):
         raise ValueError("--lora-scale, --lora-weight-name, and --lora-adapter-name require --lora.")
-    if args.batch_size > args.num_images:
-        args.batch_size = args.num_images
-
     prompts = collect_templates(args.prompt, args.prompt_file, allow_empty=False)
     negative_prompts = collect_templates(args.negative_prompt, args.negative_prompt_file, allow_empty=True)
     model, single_file = resolve_model(args.model)
 
-    base_seed = args.seed if args.seed is not None else secrets.randbelow(2**63 - args.num_images)
+    fixed_seed_mode = args.num_images < 0
+    if fixed_seed_mode and args.seed is None:
+        raise ValueError("Negative --num-images requires an explicit --seed.")
+    num_images = len(prompts) if fixed_seed_mode else args.num_images
+    batch_size = min(args.batch_size, num_images)
+
+    base_seed = args.seed if args.seed is not None else secrets.randbelow(2**63 - num_images)
     prompt_rng = random.Random(base_seed)
     expander = PromptExpander(prompt_rng, args.wildcards_dir)
-    expanded_prompts = [expander.expand(prompt_rng.choice(prompts)) for _ in range(args.num_images)]
-    expanded_negatives = [expander.expand(prompt_rng.choice(negative_prompts)) for _ in range(args.num_images)]
+    if fixed_seed_mode:
+        expanded_prompts = list(prompts)
+        expanded_negatives = [
+            negative_prompts[index % len(negative_prompts)] for index in range(num_images)
+        ]
+    else:
+        expanded_prompts = [expander.expand(prompt_rng.choice(prompts)) for _ in range(num_images)]
+        expanded_negatives = [expander.expand(prompt_rng.choice(negative_prompts)) for _ in range(num_images)]
     print('Expanded prompts and seeds:', expanded_prompts)
     print('Expanded negative prompts and seeds:', expanded_negatives)
-    seeds = [base_seed + index for index in range(args.num_images)]
+    seeds = [base_seed] * num_images if fixed_seed_mode else [base_seed + index for index in range(num_images)]
 
     pipe, loaded_loras = load_pipeline(args, model, single_file)
     supports_clip_skip = supports_call_argument(pipe, "clip_skip")
@@ -537,6 +578,13 @@ def main() -> None:
         ensure_clip_skip_compatibility(pipe)
     if args.clip_skip > 1 and not supports_clip_skip:
         print(f"Warning: {type(pipe).__name__} does not expose clip_skip; ignoring --clip-skip.", file=sys.stderr)
+    supports_negative_prompt = supports_call_argument(pipe, "negative_prompt")
+    supports_negative_prompt_embeds = supports_call_argument(pipe, "negative_prompt_embeds")
+    if any(expanded_negatives) and not (supports_negative_prompt or supports_negative_prompt_embeds):
+        print(
+            f"Warning: {type(pipe).__name__} does not support negative prompts; ignoring them.",
+            file=sys.stderr,
+        )
 
     import torch
 
@@ -544,8 +592,8 @@ def main() -> None:
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     records: list[dict[str, Any]] = []
 
-    for start in range(0, args.num_images, args.batch_size):
-        stop = min(start + args.batch_size, args.num_images)
+    for start in range(0, num_images, batch_size):
+        stop = min(start + batch_size, num_images)
         batch_prompts = expanded_prompts[start:stop]
         batch_negatives = expanded_negatives[start:stop]
         batch_seeds = seeds[start:stop]
@@ -553,12 +601,12 @@ def main() -> None:
 
         call_kwargs: dict[str, Any] = {
             "prompt": batch_prompts,
-            "negative_prompt": batch_negatives,
             "num_inference_steps": args.steps,
             "guidance_scale": args.guidance_scale,
             "num_images_per_prompt": 1,
             "generator": generators,
         }
+        call_kwargs.update(prepare_negative_prompt_kwargs(pipe, batch_negatives))
         if args.width is not None:
             call_kwargs["width"] = args.width
         if args.height is not None:
@@ -566,7 +614,7 @@ def main() -> None:
         if supports_clip_skip and diffusers_clip_skip > 0:
             call_kwargs["clip_skip"] = diffusers_clip_skip
 
-        print(f"Generating {start + 1}-{stop}/{args.num_images}...", flush=True)
+        print(f"Generating {start + 1}-{stop}/{num_images}...", flush=True)
         with torch.inference_mode():
             images = pipe(**call_kwargs).images
 
@@ -599,7 +647,9 @@ def main() -> None:
         "model_type": args.model_type,
         "loras": loaded_loras,
         "base_seed": base_seed,
-        "num_images": args.num_images,
+        "num_images": num_images,
+        "requested_num_images": args.num_images,
+        "fixed_seed_mode": fixed_seed_mode,
         "arguments": vars(args) | {"output_dir": str(args.output_dir), "wildcards_dir": str(args.wildcards_dir) if args.wildcards_dir else None},
         "images": records,
     }
