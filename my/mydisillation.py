@@ -3,6 +3,7 @@ import gc
 import json
 import re
 from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
@@ -10,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import yaml
-from accelerate import Accelerator
+from accelerate import Accelerator, InitProcessGroupKwargs
 from accelerate.utils import ProjectConfiguration, broadcast_object_list, set_seed
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
@@ -19,7 +20,7 @@ from tqdm.auto import tqdm
 from diffusers import FlowMatchEulerDiscreteScheduler, Flux2KleinPipeline, Flux2Transformer2DModel
 from diffusers.optimization import get_scheduler
 from diffusers.pipelines.flux2.pipeline_flux2_klein import compute_empirical_mu
-from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
+from diffusers.training_utils import EMAModel, compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
 
 try:
     from .publicdataset import CommonCatalogDataset
@@ -54,6 +55,9 @@ STUDENT_CONFIG_FIELDS = {
         "trajectory_rollout_steps": ("trajectory_rollout_steps", 2),
         "trajectory_num_inference_steps": ("trajectory_num_inference_steps", 50),
         "trajectory_warmup_steps": ("trajectory_warmup_steps", 1000),
+        "cfg_aware_probability": ("cfg_aware_probability", 0.0),
+        "cfg_aware_guidance_scale": ("cfg_aware_guidance_scale", 4.0),
+        "cfg_aware_warmup_steps": ("cfg_aware_warmup_steps", 0),
         "hidden_double_layers": ("hidden_double_layers", None),
         "hidden_single_layers": ("hidden_single_layers", None),
         "unconditional_probability": ("unconditional_probability", 0.0),
@@ -65,6 +69,14 @@ STUDENT_CONFIG_FIELDS = {
         "learning_rate": ("learning_rate", 1e-4),
         "lr_scheduler": ("lr_scheduler", "constant_with_warmup"),
         "lr_warmup_steps": ("lr_warmup_steps", 500),
+        "use_ema": ("use_ema", False),
+        "ema_device": ("ema_device", "gpu"),
+        "ema_decay": ("ema_decay", 0.9999),
+        "ema_update_every": ("ema_update_every", 1),
+        "ema_update_after_step": ("ema_update_after_step", 0),
+        "ema_use_warmup": ("ema_use_warmup", True),
+        "ema_inv_gamma": ("ema_inv_gamma", 1.0),
+        "ema_power": ("ema_power", 0.75),
     },
     "data": {
         "max_train_samples": ("max_train_samples", None),
@@ -157,6 +169,8 @@ class CachedFlux2Dataset(Dataset):
         sample_dir, latent_path, embedding_path = self.samples[index]
         latent = torch.load(latent_path, map_location="cpu", weights_only=True)
         embedding = torch.load(embedding_path, map_location="cpu", weights_only=True)
+        latent = latent.detach()
+        embedding = embedding.detach()
         if latent.ndim == 4 and latent.shape[0] == 1:
             latent = latent[0]
         if embedding.ndim == 3 and embedding.shape[0] == 1:
@@ -726,6 +740,193 @@ def count_parameters(model):
     return sum(parameter.numel() for parameter in model.parameters())
 
 
+class EMATracker:
+    METADATA_NAME = "ema_state.json"
+
+    def __init__(
+        self,
+        model,
+        device,
+        decay,
+        update_every,
+        update_after_step,
+        use_warmup,
+        inv_gamma,
+        power,
+    ):
+        if device not in ("gpu", "cpu"):
+            raise ValueError(f"Unsupported EMA device: {device}")
+        self.device = device
+        self.parameter_names = [name for name, _ in model.named_parameters()]
+        self.update_every = update_every
+        self.last_update_step = 0
+        self.ema = EMAModel(
+            [],
+            decay=decay,
+            update_after_step=update_after_step,
+            use_ema_warmup=use_warmup,
+            inv_gamma=inv_gamma,
+            power=power,
+            foreach=False,
+            model_cls=type(model),
+            model_config=dict(model.config),
+        )
+        if self.device == "gpu":
+            self.ema.shadow_params = [parameter.detach().float().clone() for parameter in model.parameters()]
+        else:
+            self.ema.shadow_params = [
+                torch.empty(parameter.shape, dtype=torch.float32, device="cpu", pin_memory=True)
+                for parameter in model.parameters()
+            ]
+        self.staging_params = [
+            torch.empty(parameter.shape, dtype=torch.float32, device="cpu", pin_memory=True)
+            for parameter in model.parameters()
+        ]
+        self.reset_from(model, global_step=0)
+
+    def _model_parameters(self, model):
+        parameters = list(model.parameters())
+        if len(parameters) != len(self.ema.shadow_params):
+            raise ValueError(
+                f"EMA parameter count mismatch: model={len(parameters)}, ema={len(self.ema.shadow_params)}"
+            )
+        return parameters
+
+    @torch.no_grad()
+    def _copy_model_to_staging(self, model):
+        parameters = self._model_parameters(model)
+        cuda_device = None
+        for staging, parameter in zip(self.staging_params, parameters):
+            if parameter.device.type == "cuda":
+                cuda_device = parameter.device
+            staging.copy_(parameter.detach(), non_blocking=parameter.device.type == "cuda")
+        if cuda_device is not None:
+            torch.cuda.synchronize(cuda_device)
+        return parameters
+
+    @torch.no_grad()
+    def reset_from(self, model, global_step):
+        if self.device == "cpu":
+            self._copy_model_to_staging(model)
+            for shadow, current in zip(self.ema.shadow_params, self.staging_params):
+                shadow.copy_(current)
+        else:
+            for shadow, parameter in zip(self.ema.shadow_params, self._model_parameters(model)):
+                shadow.copy_(parameter.detach())
+        self.ema.optimization_step = 0
+        self.ema.cur_decay_value = None
+        self.last_update_step = global_step
+
+    @torch.no_grad()
+    def step(self, model, global_step):
+        elapsed_steps = global_step - self.last_update_step
+        if elapsed_steps < self.update_every:
+            return False
+        if elapsed_steps < 1:
+            raise ValueError(
+                f"EMA global step must increase: last={self.last_update_step}, current={global_step}"
+            )
+
+        if self.device == "cpu":
+            self._copy_model_to_staging(model)
+            current_parameters = self.staging_params
+        else:
+            current_parameters = self._model_parameters(model)
+        self.ema.optimization_step += elapsed_steps
+        per_step_decay = self.ema.get_decay(self.ema.optimization_step)
+        effective_decay = per_step_decay**elapsed_steps
+        self.ema.cur_decay_value = effective_decay
+        for shadow, current in zip(self.ema.shadow_params, current_parameters):
+            shadow.lerp_(current.detach(), 1 - effective_decay)
+        self.last_update_step = global_step
+        return True
+
+    @contextmanager
+    def apply_to(self, model):
+        parameters = self._copy_model_to_staging(model)
+        cuda_device = next((parameter.device for parameter in parameters if parameter.device.type == "cuda"), None)
+        for parameter, shadow in zip(parameters, self.ema.shadow_params):
+            parameter.data.copy_(shadow, non_blocking=parameter.device.type == "cuda")
+        if cuda_device is not None:
+            torch.cuda.synchronize(cuda_device)
+        try:
+            yield
+        finally:
+            for parameter, stored in zip(parameters, self.staging_params):
+                parameter.data.copy_(stored, non_blocking=parameter.device.type == "cuda")
+            if cuda_device is not None:
+                torch.cuda.synchronize(cuda_device)
+
+    def _metadata(self):
+        return {
+            "decay": self.ema.decay,
+            "min_decay": self.ema.min_decay,
+            "optimization_step": self.ema.optimization_step,
+            "update_after_step": self.ema.update_after_step,
+            "use_ema_warmup": self.ema.use_ema_warmup,
+            "inv_gamma": self.ema.inv_gamma,
+            "power": self.ema.power,
+            "cur_decay_value": self.ema.cur_decay_value,
+            "update_every": self.update_every,
+            "last_update_step": self.last_update_step,
+            "device": self.device,
+            "dtype": "float32",
+        }
+
+    @torch.no_grad()
+    def save_pretrained(self, model, path):
+        path = Path(path)
+        with self.apply_to(model):
+            model.save_pretrained(path, safe_serialization=True)
+        (path / self.METADATA_NAME).write_text(
+            json.dumps(self._metadata(), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    @torch.no_grad()
+    def load_pretrained(self, path):
+        path = Path(path)
+        metadata_path = path / self.METADATA_NAME
+        if not metadata_path.is_file():
+            raise ValueError(f"EMA metadata not found: {metadata_path}")
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("update_every") != self.update_every:
+            raise ValueError(
+                f"EMA update interval mismatch: checkpoint={metadata.get('update_every')}, "
+                f"current={self.update_every}"
+            )
+
+        loaded = Flux2Transformer2DModel.from_pretrained(
+            path,
+            dtype=torch.float32,
+            local_files_only=True,
+        )
+        loaded_names = [name for name, _ in loaded.named_parameters()]
+        if loaded_names != self.parameter_names:
+            raise ValueError("EMA checkpoint parameter names do not match the current student")
+        for shadow, parameter in zip(self.ema.shadow_params, loaded.parameters()):
+            shadow.copy_(parameter.detach())
+        del loaded
+        gc.collect()
+
+        self.ema.load_state_dict(
+            {
+                key: metadata[key]
+                for key in (
+                    "decay",
+                    "min_decay",
+                    "optimization_step",
+                    "update_after_step",
+                    "use_ema_warmup",
+                    "inv_gamma",
+                    "power",
+                )
+            }
+        )
+        self.ema.cur_decay_value = metadata.get("cur_decay_value")
+        self.last_update_step = int(metadata["last_update_step"])
+
+
 def resolve_latest_checkpoint(output_dir):
     checkpoints = []
     for path in output_dir.glob("checkpoint-*"):
@@ -735,11 +936,13 @@ def resolve_latest_checkpoint(output_dir):
     return max(checkpoints, default=(None, None))[1]
 
 
-def register_accelerator_hooks(accelerator):
+def register_accelerator_hooks(accelerator, ema_tracker=None):
     def save_model_hook(models, weights, output_dir):
+        student_model = None
         for model in models:
             unwrapped = accelerator.unwrap_model(model)
             if isinstance(unwrapped, Flux2Transformer2DModel):
+                student_model = unwrapped
                 if accelerator.is_main_process:
                     state_dict = accelerator.get_state_dict(model)
                     unwrapped.save_pretrained(
@@ -754,12 +957,18 @@ def register_accelerator_hooks(accelerator):
                 raise ValueError(f"Unexpected model in checkpoint: {type(unwrapped).__name__}")
             if weights:
                 weights.pop()
+        if accelerator.is_main_process and ema_tracker is not None:
+            if student_model is None:
+                raise ValueError("Student transformer was not provided to the EMA checkpoint hook")
+            ema_tracker.save_pretrained(student_model, Path(output_dir) / "transformer_ema")
 
     def load_model_hook(models, input_dir):
+        student_model = None
         while models:
             model = models.pop()
             unwrapped = accelerator.unwrap_model(model)
             if isinstance(unwrapped, Flux2Transformer2DModel):
+                student_model = unwrapped
                 loaded = Flux2Transformer2DModel.from_pretrained(
                     input_dir,
                     subfolder="transformer",
@@ -776,6 +985,20 @@ def register_accelerator_hooks(accelerator):
                 unwrapped.load_state_dict(torch.load(projection_path, map_location="cpu", weights_only=True))
             else:
                 raise ValueError(f"Unexpected model in checkpoint: {type(unwrapped).__name__}")
+        if accelerator.is_main_process and ema_tracker is not None:
+            if student_model is None:
+                raise ValueError("Student transformer was not provided to the EMA checkpoint hook")
+            ema_path = Path(input_dir) / "transformer_ema"
+            if ema_path.is_dir():
+                ema_tracker.load_pretrained(ema_path)
+            else:
+                match = CHECKPOINT_PATTERN.fullmatch(Path(input_dir).name)
+                global_step = int(match.group(1)) if match is not None else 0
+                ema_tracker.reset_from(student_model, global_step=global_step)
+                accelerator.print(
+                    f"EMA state not found in {input_dir}; initialized {ema_tracker.device} EMA "
+                    f"from raw student weights at step {global_step}"
+                )
 
     accelerator.register_save_state_pre_hook(save_model_hook)
     accelerator.register_load_state_pre_hook(load_model_hook)
@@ -842,6 +1065,12 @@ def transformer_prediction(
     return prediction[:, : packed_latents.shape[1]]
 
 
+def classifier_free_guidance(conditional_prediction, unconditional_prediction, guidance_scale):
+    return unconditional_prediction + guidance_scale * (
+        conditional_prediction - unconditional_prediction
+    )
+
+
 def weighted_mse(prediction, target, weights):
     per_sample = (prediction.float() - target.float()).pow(2).flatten(1).mean(1)
     return (per_sample * weights.float().flatten()).mean()
@@ -892,6 +1121,8 @@ def rollout_student_trajectory(
     rollout_steps,
     guidance_scale,
     reference_latents=None,
+    negative_prompt_embeds=None,
+    cfg_guidance_scale=None,
 ):
     num_inference_steps = len(trajectory_timesteps)
     max_start_index = num_inference_steps - rollout_steps - 1
@@ -912,6 +1143,20 @@ def rollout_student_trajectory(
             guidance_scale,
             reference_latents=reference_latents,
         )
+        if negative_prompt_embeds is not None:
+            unconditional_prediction = transformer_prediction(
+                student,
+                trajectory_latents,
+                negative_prompt_embeds,
+                current_timesteps,
+                guidance_scale,
+                reference_latents=reference_latents,
+            )
+            prediction = classifier_free_guidance(
+                prediction,
+                unconditional_prediction,
+                cfg_guidance_scale,
+            )
         velocity = unpack_latent_prediction(prediction, trajectory_latents.shape)
         delta_sigmas = trajectory_sigmas[current_indices + 1] - trajectory_sigmas[current_indices]
         while delta_sigmas.ndim < trajectory_latents.ndim:
@@ -1446,6 +1691,14 @@ def parse_args():
     parser.add_argument("--learning_rate", type=float)
     parser.add_argument("--lr_scheduler")
     parser.add_argument("--lr_warmup_steps", type=int)
+    parser.add_argument("--use_ema", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--ema_device", choices=("gpu", "cpu"))
+    parser.add_argument("--ema_decay", type=float)
+    parser.add_argument("--ema_update_every", type=int)
+    parser.add_argument("--ema_update_after_step", type=int)
+    parser.add_argument("--ema_use_warmup", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--ema_inv_gamma", type=float)
+    parser.add_argument("--ema_power", type=float)
     parser.add_argument("--adam_beta1", type=float, default=0.9)
     parser.add_argument("--adam_beta2", type=float, default=0.999)
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2)
@@ -1461,6 +1714,9 @@ def parse_args():
     parser.add_argument("--trajectory_rollout_steps", type=int)
     parser.add_argument("--trajectory_num_inference_steps", type=int)
     parser.add_argument("--trajectory_warmup_steps", type=int)
+    parser.add_argument("--cfg_aware_probability", type=float)
+    parser.add_argument("--cfg_aware_guidance_scale", type=float)
+    parser.add_argument("--cfg_aware_warmup_steps", type=int)
     parser.add_argument("--hidden_double_layers", type=int, nargs="+")
     parser.add_argument("--hidden_single_layers", type=int, nargs="+")
     parser.add_argument("--unconditional_probability", type=float)
@@ -1474,6 +1730,16 @@ def parse_args():
     parser.add_argument("--mode_scale", type=float, default=1.29)
     parser.add_argument("--guidance_scale", type=float, default=1.0)
     parser.add_argument("--mixed_precision", choices=("no", "fp16", "bf16"), default="bf16")
+    parser.add_argument(
+        "--nccl_timeout_minutes",
+        type=int,
+        default=60,
+        help=(
+            "Timeout for NCCL collective ops (e.g. wait_for_everyone barriers). Validation generates "
+            "validation.num_images sequentially on the main process alone, which can exceed the default "
+            "10-minute NCCL timeout and get the job killed as a false-positive hang."
+        ),
+    )
     parser.add_argument("--allow_tf32", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--checkpointing_steps", type=int, default=1000)
@@ -1555,6 +1821,12 @@ def parse_args():
         parser.error("--trajectory_rollout_steps must be smaller than --trajectory_num_inference_steps")
     if args.trajectory_warmup_steps < 0:
         parser.error("--trajectory_warmup_steps must be non-negative")
+    if not 0 <= args.cfg_aware_probability <= 1:
+        parser.error("--cfg_aware_probability must be between 0 and 1")
+    if args.cfg_aware_probability > 0 and args.cfg_aware_guidance_scale <= 1:
+        parser.error("Positive --cfg_aware_probability requires --cfg_aware_guidance_scale greater than 1")
+    if args.cfg_aware_warmup_steps < 0:
+        parser.error("--cfg_aware_warmup_steps must be non-negative")
     hidden_double_layers = args.hidden_double_layers or []
     hidden_single_layers = args.hidden_single_layers or []
     if hidden_double_layers != sorted(set(hidden_double_layers)) or any(
@@ -1591,6 +1863,16 @@ def parse_args():
         parser.error("--unconditional_probability must be between 0 and 1")
     if args.learning_rate <= 0:
         parser.error("--learning_rate must be positive")
+    if not 0 <= args.ema_decay <= 1:
+        parser.error("--ema_decay must be between 0 and 1")
+    if args.ema_update_every < 1:
+        parser.error("--ema_update_every must be at least 1 optimizer step")
+    if args.ema_update_after_step < 0:
+        parser.error("--ema_update_after_step must be non-negative")
+    if args.ema_inv_gamma <= 0:
+        parser.error("--ema_inv_gamma must be positive")
+    if args.ema_power <= 0:
+        parser.error("--ema_power must be positive")
     if (args.validation_height is None) != (args.validation_width is None):
         parser.error("--validation_height and --validation_width must be specified together")
     if args.validation_height is not None and (
@@ -1610,11 +1892,17 @@ def main():
 
     logging_dir = output_dir / args.logging_dir
     project_config = ProjectConfiguration(project_dir=output_dir, logging_dir=logging_dir)
+    # Validation runs num_images sequentially on the main process only (see generate_validation_images),
+    # while other ranks wait at accelerator.wait_for_everyone(). With validation.num_images=100 this can
+    # exceed NCCL's default 10-minute collective timeout and abort the whole job (SIGABRT on the watchdog
+    # timeout), even though nothing is actually stuck.
+    process_group_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=args.nccl_timeout_minutes))
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=None if args.report_to == "none" else args.report_to,
         project_config=project_config,
+        kwargs_handlers=[process_group_kwargs],
     )
     if args.max_train_samples is not None and args.max_train_samples % accelerator.num_processes:
         raise ValueError(
@@ -1833,13 +2121,32 @@ def main():
         )
 
     empty_prompt_embedding = None
-    if args.unconditional_probability > 0:
+    if args.unconditional_probability > 0 or args.cfg_aware_probability > 0:
         empty_prompt_embedding = load_empty_prompt_embedding(
             args,
             weight_dtype,
             accelerator.device,
             text_pipeline=public_encoding_pipeline,
         )
+
+    ema_tracker = None
+    if args.use_ema and accelerator.is_main_process:
+        try:
+            ema_tracker = EMATracker(
+                student,
+                device=args.ema_device,
+                decay=args.ema_decay,
+                update_every=args.ema_update_every,
+                update_after_step=args.ema_update_after_step,
+                use_warmup=args.ema_use_warmup,
+                inv_gamma=args.ema_inv_gamma,
+                power=args.ema_power,
+            )
+        except torch.OutOfMemoryError as error:
+            raise RuntimeError(
+                "GPU EMA allocation failed. Re-run with --ema_device cpu; "
+                "CPU EMA uses pinned host memory and does not add a full student copy to VRAM."
+            ) from error
 
     trainable_parameters = list(student.parameters())
     if hidden_projections is not None:
@@ -1866,7 +2173,7 @@ def main():
         )
     if not is_public_dataset:
         dataloader = accelerator.prepare(dataloader)
-    register_accelerator_hooks(accelerator)
+    register_accelerator_hooks(accelerator, ema_tracker=ema_tracker)
 
     if accelerator.is_main_process:
         tracker_config = {
@@ -1903,12 +2210,30 @@ def main():
             args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
         )
         print(f"Global batch size: {global_batch_size}")
+        if ema_tracker is not None:
+            ema_gib = sum(parameter.numel() * parameter.element_size() for parameter in ema_tracker.ema.shadow_params)
+            staging_gib = sum(parameter.numel() * parameter.element_size() for parameter in ema_tracker.staging_params)
+            print(
+                "EMA: "
+                f"device={args.ema_device}, decay={args.ema_decay}, "
+                f"update_every={args.ema_update_every} optimizer step(s), "
+                f"warmup={args.ema_use_warmup}, power={args.ema_power}, "
+                f"shadow_memory={ema_gib / 2**30:.2f} GiB, "
+                f"host_staging={staging_gib / 2**30:.2f} GiB"
+            )
         if args.lambda_trajectory > 0 and args.trajectory_probability > 0:
             print(
                 "Trajectory KD: "
                 f"probability={args.trajectory_probability}, rollout_steps={args.trajectory_rollout_steps}, "
                 f"inference_steps={args.trajectory_num_inference_steps}, "
                 f"warmup_steps={args.trajectory_warmup_steps}, weight={args.lambda_trajectory}"
+            )
+        if args.cfg_aware_probability > 0:
+            print(
+                "CFG-aware KD: "
+                f"probability={args.cfg_aware_probability}, "
+                f"guidance_scale={args.cfg_aware_guidance_scale}, "
+                f"warmup_steps={args.cfg_aware_warmup_steps}"
             )
 
     global_step = 0
@@ -1973,12 +2298,13 @@ def main():
                 weight_dtype,
             )
             log_validation_images(
-                accelerator, "validation/teacher", teacher_images, validation_samples, args, 0
+                accelerator, "validation/teacher", teacher_images, validation_samples, args, global_step
             )
         accelerator.wait_for_everyone()
 
     progress_bar = tqdm(
-        range(global_step, args.max_train_steps),
+        total=args.max_train_steps,
+        initial=global_step,
         disable=not accelerator.is_local_main_process,
         desc="Steps",
     )
@@ -2018,11 +2344,37 @@ def main():
                     prompt_embeds = batch["embeddings"].to(
                         accelerator.device, dtype=weight_dtype, non_blocking=True
                     )
-                prompt_embeds, unconditional_fraction = apply_conditioning_dropout(
-                    prompt_embeds,
-                    empty_prompt_embedding,
-                    args.unconditional_probability,
+                cfg_aware_active = (
+                    not clone_check_pending
+                    and global_step >= args.cfg_aware_warmup_steps
+                    and args.cfg_aware_probability > 0
+                    and deterministic_probability_sample(args.seed + 1000003, training_micro_step)
+                    < args.cfg_aware_probability
                 )
+                negative_prompt_embeds = None
+                if cfg_aware_active:
+                    if empty_prompt_embedding is None:
+                        raise RuntimeError("CFG-aware KD requires an empty prompt embedding")
+                    if empty_prompt_embedding.ndim != prompt_embeds.ndim or empty_prompt_embedding.shape[0] != 1:
+                        raise ValueError(
+                            "Empty prompt embedding must have shape (1,L,D), got "
+                            f"{tuple(empty_prompt_embedding.shape)}"
+                        )
+                    if empty_prompt_embedding.shape[1:] != prompt_embeds.shape[1:]:
+                        raise ValueError(
+                            "Empty prompt embedding shape does not match conditional embeddings: "
+                            f"{tuple(empty_prompt_embedding.shape)} vs {tuple(prompt_embeds.shape)}"
+                        )
+                    negative_prompt_embeds = empty_prompt_embedding.expand(
+                        prompt_embeds.shape[0], -1, -1
+                    )
+                    unconditional_fraction = torch.zeros((), device=prompt_embeds.device)
+                else:
+                    prompt_embeds, unconditional_fraction = apply_conditioning_dropout(
+                        prompt_embeds,
+                        empty_prompt_embedding,
+                        args.unconditional_probability,
+                    )
                 noise = torch.randn_like(model_input)
                 batch_size = model_input.shape[0]
                 timestep_density = compute_density_for_timestep_sampling(
@@ -2074,6 +2426,8 @@ def main():
                             args.trajectory_rollout_steps,
                             args.guidance_scale,
                             reference_latents=reference_latents,
+                            negative_prompt_embeds=negative_prompt_embeds,
+                            cfg_guidance_scale=args.cfg_aware_guidance_scale,
                         )
 
                 with capture_hidden_features(
@@ -2083,7 +2437,7 @@ def main():
                     detach=True,
                 ) as teacher_features:
                     with torch.no_grad(), accelerator.autocast():
-                        teacher_prediction = transformer_prediction(
+                        teacher_conditional_prediction = transformer_prediction(
                             teacher,
                             noisy_model_input,
                             prompt_embeds,
@@ -2091,6 +2445,23 @@ def main():
                             args.guidance_scale,
                             reference_latents=reference_latents,
                         )
+                if cfg_aware_active:
+                    with torch.no_grad(), accelerator.autocast():
+                        teacher_unconditional_prediction = transformer_prediction(
+                            teacher,
+                            noisy_model_input,
+                            negative_prompt_embeds,
+                            timesteps,
+                            args.guidance_scale,
+                            reference_latents=reference_latents,
+                        )
+                    teacher_prediction = classifier_free_guidance(
+                        teacher_conditional_prediction,
+                        teacher_unconditional_prediction,
+                        args.cfg_aware_guidance_scale,
+                    )
+                else:
+                    teacher_prediction = teacher_conditional_prediction
 
                 with capture_hidden_features(
                     student,
@@ -2099,7 +2470,7 @@ def main():
                 ) as student_features:
                     if clone_check_pending:
                         with torch.no_grad(), accelerator.autocast():
-                            student_prediction = transformer_prediction(
+                            student_conditional_prediction = transformer_prediction(
                                 student,
                                 noisy_model_input,
                                 prompt_embeds,
@@ -2108,7 +2479,7 @@ def main():
                                 reference_latents=reference_latents,
                             )
                     else:
-                        student_prediction = transformer_prediction(
+                        student_conditional_prediction = transformer_prediction(
                             student,
                             noisy_model_input,
                             prompt_embeds,
@@ -2116,6 +2487,22 @@ def main():
                             args.guidance_scale,
                             reference_latents=reference_latents,
                         )
+                if cfg_aware_active:
+                    student_unconditional_prediction = transformer_prediction(
+                        student,
+                        noisy_model_input,
+                        negative_prompt_embeds,
+                        timesteps,
+                        args.guidance_scale,
+                        reference_latents=reference_latents,
+                    )
+                    student_prediction = classifier_free_guidance(
+                        student_conditional_prediction,
+                        student_unconditional_prediction,
+                        args.cfg_aware_guidance_scale,
+                    )
+                else:
+                    student_prediction = student_conditional_prediction
                 loss_weights = compute_loss_weighting_for_sd3(
                     weighting_scheme=args.weighting_scheme,
                     sigmas=sigmas,
@@ -2131,8 +2518,16 @@ def main():
                     loss_trajectory = loss_flow
                     flow_weight = args.lambda_trajectory
                 else:
-                    loss_gt = weighted_mse(student_prediction, packed_target, loss_weights)
-                    teacher_gt = weighted_mse(teacher_prediction, packed_target, loss_weights)
+                    loss_gt = weighted_mse(
+                        student_conditional_prediction,
+                        packed_target,
+                        loss_weights,
+                    )
+                    teacher_gt = weighted_mse(
+                        teacher_conditional_prediction,
+                        packed_target,
+                        loss_weights,
+                    )
                     loss_trajectory = zero_loss
                     flow_weight = args.lambda_flow
                 loss_hidden = torch.zeros((), device=student_prediction.device, dtype=torch.float32)
@@ -2144,6 +2539,8 @@ def main():
                         mapping[0],
                         mapping[1],
                     )
+                loss_cfg_flow = loss_flow if cfg_aware_active else zero_loss
+                loss_base_flow = zero_loss if cfg_aware_active else loss_flow
                 loss = (
                     args.lambda_gt * loss_gt
                     + flow_weight * loss_flow
@@ -2167,7 +2564,8 @@ def main():
                     raise RuntimeError(
                         f"Non-finite loss at step {global_step}: total={loss.item()}, "
                         f"gt={loss_gt.item()}, flow={loss_flow.item()}, hidden={loss_hidden.item()}, "
-                        f"direction={loss_direction.item()}, trajectory={loss_trajectory.item()}"
+                        f"direction={loss_direction.item()}, trajectory={loss_trajectory.item()}, "
+                        f"cfg_aware={int(cfg_aware_active)}"
                     )
 
                 accelerator.backward(loss)
@@ -2180,12 +2578,17 @@ def main():
 
             if accelerator.sync_gradients:
                 global_step += 1
+                ema_updated = False
+                if ema_tracker is not None:
+                    ema_updated = ema_tracker.step(accelerator.unwrap_model(student), global_step)
                 progress_bar.update(1)
                 logs = {
                     "train/loss": loss.detach().item(),
                     "train/loss_gt": loss_gt.detach().item(),
                     "train/loss_kd": loss_flow.detach().item(),
                     "train/loss_flow": loss_flow.detach().item(),
+                    "train/loss_base_flow": loss_base_flow.detach().item(),
+                    "train/loss_cfg_flow": loss_cfg_flow.detach().item(),
                     "train/loss_hidden": loss_hidden.detach().item(),
                     "train/loss_direction": loss_direction.detach().item(),
                     "train/loss_trajectory": loss_trajectory.detach().item(),
@@ -2193,13 +2596,19 @@ def main():
                     "train/lr": lr_scheduler.get_last_lr()[0],
                     "train/unconditional_fraction": unconditional_fraction.detach().item(),
                     "train/trajectory_fraction": float(trajectory_active),
+                    "train/cfg_aware_fraction": float(cfg_aware_active),
+                    "train/cfg_trajectory_fraction": float(cfg_aware_active and trajectory_active),
                     "train/epoch": epoch + 1,
                 }
+                if ema_tracker is not None:
+                    logs["train/ema_decay"] = float(ema_tracker.ema.cur_decay_value or 0.0)
+                    logs["train/ema_updated"] = float(ema_updated)
                 progress_bar.set_postfix(
                     loss=f"{logs['train/loss']:.4f}",
                     flow=f"{logs['train/loss_flow']:.4f}",
                     hidden=f"{logs['train/loss_hidden']:.4f}",
                     trajectory=int(trajectory_active),
+                    cfg=int(cfg_aware_active),
                 )
                 accelerator.log(logs, step=global_step)
 
@@ -2211,10 +2620,11 @@ def main():
                 if args.validation_steps > 0 and global_step % args.validation_steps == 0:
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
+                        unwrapped_student = accelerator.unwrap_model(student)
                         student_images = generate_validation_images(
                             accelerator,
                             validation_pipeline,
-                            accelerator.unwrap_model(student),
+                            unwrapped_student,
                             validation_samples,
                             validation_negative_prompt_embeds,
                             args,
@@ -2228,6 +2638,25 @@ def main():
                             args,
                             global_step,
                         )
+                        if ema_tracker is not None:
+                            with ema_tracker.apply_to(unwrapped_student):
+                                ema_images = generate_validation_images(
+                                    accelerator,
+                                    validation_pipeline,
+                                    unwrapped_student,
+                                    validation_samples,
+                                    validation_negative_prompt_embeds,
+                                    args,
+                                    weight_dtype,
+                                )
+                            log_validation_images(
+                                accelerator,
+                                "validation/student_ema",
+                                ema_images,
+                                validation_samples,
+                                args,
+                                global_step,
+                            )
                     accelerator.wait_for_everyone()
 
             if global_step >= args.max_train_steps:
@@ -2239,10 +2668,11 @@ def main():
         if not is_public_dataset and args.validation_epochs > 0 and (epoch + 1) % args.validation_epochs == 0:
             accelerator.wait_for_everyone()
             if accelerator.is_main_process:
+                unwrapped_student = accelerator.unwrap_model(student)
                 student_images = generate_validation_images(
                     accelerator,
                     validation_pipeline,
-                    accelerator.unwrap_model(student),
+                    unwrapped_student,
                     validation_samples,
                     validation_negative_prompt_embeds,
                     args,
@@ -2256,6 +2686,25 @@ def main():
                     args,
                     global_step,
                 )
+                if ema_tracker is not None:
+                    with ema_tracker.apply_to(unwrapped_student):
+                        ema_images = generate_validation_images(
+                            accelerator,
+                            validation_pipeline,
+                            unwrapped_student,
+                            validation_samples,
+                            validation_negative_prompt_embeds,
+                            args,
+                            weight_dtype,
+                        )
+                    log_validation_images(
+                        accelerator,
+                        "validation/student_ema",
+                        ema_images,
+                        validation_samples,
+                        args,
+                        global_step,
+                    )
             accelerator.wait_for_everyone()
 
         epoch += 1
@@ -2264,11 +2713,14 @@ def main():
     if accelerator.is_main_process and not args.skip_final_save:
         final_dir = output_dir / "student"
         state_dict = accelerator.get_state_dict(student)
-        accelerator.unwrap_model(student).save_pretrained(
+        unwrapped_student = accelerator.unwrap_model(student)
+        unwrapped_student.save_pretrained(
             final_dir,
             state_dict=state_dict,
             safe_serialization=True,
         )
+        if ema_tracker is not None:
+            ema_tracker.save_pretrained(unwrapped_student, output_dir / "student_ema")
         (output_dir / "training_args.json").write_text(
             json.dumps(vars(args), ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",

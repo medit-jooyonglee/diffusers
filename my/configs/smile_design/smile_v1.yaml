@@ -1,0 +1,99 @@
+version: 1
+template_version: smile-v1
+
+base_template: |-
+  Edit the dental photograph using the reference images in the declared order.
+  {reference_instructions}
+  Preserve the patient's identity, head pose, face geometry, eyes, nose, skin, hair, lighting, clothing, and background.
+  Modify only the teeth and local mouth region requested below. Keep the result anatomically plausible and photorealistic.
+  Tooth whitening: {whitening}
+  Smile intensity: {smile_intensity}
+  Tooth roundness: {tooth_roundness}
+  Gum exposure: {gum_exposure}
+  Mouth opening: {mouth_opening}
+
+layouts:
+  patient_only:
+    roles: [patient]
+    instruction: Use image 1 as the original patient and preserve it except for the requested dental edit.
+  patient_tooth:
+    roles: [patient, tooth]
+    instruction: Use image 1 as the original patient. Use image 2 only for tooth morphology, proportions, incisal edges, and arrangement.
+  patient_mouth:
+    roles: [patient, mouth]
+    instruction: Use image 1 as the original patient. Use image 2 only for mouth, lip, and smile style.
+  patient_tooth_mouth:
+    roles: [patient, tooth, mouth]
+    instruction: Use image 1 as the original patient. Use image 2 only for tooth morphology and proportions. Use image 3 only for mouth, lip, and smile style.
+  patient_tooth_mouth_pose:
+    roles: [patient, tooth, mouth, pose]
+    instruction: Use image 1 as the original patient. Use image 2 only for tooth morphology and proportions. Use image 3 only for mouth, lip, and smile style. Use image 4 only for pose and viewpoint.
+  patient_tooth_mouth_pose_extra:
+    roles: [patient, tooth, mouth, pose, extra]
+    instruction: Use image 1 as the original patient. Use image 2 only for tooth morphology and proportions. Use image 3 only for mouth, lip, and smile style. Use image 4 only for pose and viewpoint. Use image 5 only for supplemental dental restoration appearance.
+
+controls:
+  whitening:
+    default: 0
+    anchors:
+      "0": preserve the patient's original natural tooth color
+      "25": apply very subtle natural whitening
+      "50": apply mild natural whitening
+      "75": apply clear bright cosmetic whitening while retaining enamel texture
+      "100": apply strong bright whitening while retaining realistic enamel detail
+  smile_intensity:
+    default: 50
+    anchors:
+      "0": preserve a neutral relaxed mouth expression
+      "25": create a subtle restrained smile
+      "50": create a natural medium smile
+      "75": create a broad confident smile
+      "100": create a strong broad smile with anatomically plausible facial motion
+  tooth_roundness:
+    default: 50
+    anchors:
+      "0": use squared anterior tooth contours and flatter incisal edges
+      "25": use slightly squared natural tooth contours
+      "50": preserve natural balanced tooth contours
+      "75": use softly rounded anterior tooth contours
+      "100": use clearly rounded cosmetic anterior tooth contours
+  gum_exposure:
+    default: 25
+    anchors:
+      "0": minimize visible gingiva
+      "25": preserve low natural gingival exposure
+      "50": show natural moderate gingival exposure
+      "75": show clearly increased gingival exposure
+      "100": show high but anatomically plausible gingival exposure
+  mouth_opening:
+    default: 25
+    anchors:
+      "0": keep the mouth closed
+      "25": keep the mouth slightly open
+      "50": use a natural medium mouth opening
+      "75": use a clearly open smiling mouth
+      "100": use a wide but anatomically plausible mouth opening
+
+presets:
+  natural:
+    whitening: 0
+    smile_intensity: 50
+    tooth_roundness: 50
+    gum_exposure: 25
+    mouth_opening: 25
+  mild_whitening:
+    whitening: 50
+  strong_whitening:
+    whitening: 100
+  subtle_smile:
+    smile_intensity: 25
+  broad_smile:
+    smile_intensity: 75
+  cosmetic_rounded:
+    whitening: 75
+    smile_intensity: 75
+    tooth_roundness: 100
+
+grids:
+  whitening_smile:
+    attributes: [whitening, smile_intensity]
