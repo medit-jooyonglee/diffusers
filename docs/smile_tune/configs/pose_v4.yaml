@@ -1,0 +1,109 @@
+version: 1
+template_version: pose-v4
+base_template: 'Edit image 1, a portrait photo of this person. {reference_instructions}
+
+  Keep exactly the same person: face shape, facial proportions, eye shape, eyebrows, nose, lips, skin tone and skin texture, age, hairstyle, makeup, and accessories.
+
+  Keep the lighting, clothing, image quality, and background.
+
+  Head yaw: {head_yaw}
+
+  Head pitch: {head_pitch}
+
+  Keep the facial expression as in image 1. Modify only the teeth and local mouth region as requested below, and the head orientation.
+
+  Tooth whitening: {whitening}
+
+  Smile intensity: {smile_intensity}
+
+  Tooth roundness: {tooth_roundness}
+
+  Gum exposure: {gum_exposure}
+
+  Mouth opening: {mouth_opening}'
+layouts:
+  patient_only:
+    roles:
+    - patient
+    instruction: Apply the dental edit and the head orientation described below.
+controls:
+  whitening:
+    default: 0
+    anchors:
+      '0': preserve the patient's original natural tooth color
+      '25': apply very subtle natural whitening
+      '50': apply mild natural whitening
+      '75': apply clear bright cosmetic whitening while retaining enamel texture
+      '100': apply strong bright whitening while retaining realistic enamel detail
+  smile_intensity:
+    default: 50
+    anchors:
+      '0': preserve a neutral relaxed mouth expression
+      '25': create a subtle restrained smile
+      '50': create a natural medium smile
+      '75': create a broad confident smile
+      '100': create a strong broad smile with anatomically plausible facial motion
+  tooth_roundness:
+    default: 50
+    anchors:
+      '0': use squared anterior tooth contours and flatter incisal edges
+      '25': use slightly squared natural tooth contours
+      '50': preserve natural balanced tooth contours
+      '75': use softly rounded anterior tooth contours
+      '100': use clearly rounded cosmetic anterior tooth contours
+  gum_exposure:
+    default: 25
+    anchors:
+      '0': minimize visible gingiva
+      '25': preserve low natural gingival exposure
+      '50': show natural moderate gingival exposure
+      '75': show clearly increased gingival exposure
+      '100': show high but anatomically plausible gingival exposure
+  mouth_opening:
+    default: 25
+    anchors:
+      '0': keep the mouth closed
+      '25': keep the mouth slightly open
+      '50': use a natural medium mouth opening
+      '75': use a clearly open smiling mouth
+      '100': use a wide but anatomically plausible mouth opening
+  head_yaw:
+    default: 50
+    anchors:
+      '0': turn the head clearly to the side so the face points toward the left edge of the image, a three-quarter view
+      '25': turn the head slightly so the face points a little toward the left edge of the image
+      '50': keep the head orientation exactly as in image 1
+      '75': turn the head slightly so the face points a little toward the right edge of the image
+      '100': turn the head clearly to the side so the face points toward the right edge of the image, a three-quarter view
+  head_pitch:
+    default: 50
+    anchors:
+      '0': tilt the head far down, chin pressed toward the chest, the camera sees the top of the head and the eyes look down
+      '25': tilt the head moderately down with the chin lowered
+      '50': keep the head tilt exactly as in image 1
+      '75': tilt the head moderately up with the chin raised
+      '100': tilt the head far back and up, chin raised high, the camera sees under the chin and the eyes look up
+presets:
+  natural:
+    whitening: 0
+    smile_intensity: 50
+    tooth_roundness: 50
+    gum_exposure: 25
+    mouth_opening: 25
+  white_yaw0:
+    whitening: 100
+    head_yaw: 0
+  white_yaw100:
+    whitening: 100
+    head_yaw: 100
+  smile_pitch100:
+    smile_intensity: 100
+    head_pitch: 100
+  smile_pitch0:
+    smile_intensity: 100
+    head_pitch: 0
+grids:
+  yaw_pitch:
+    attributes:
+    - head_yaw
+    - head_pitch
