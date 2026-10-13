@@ -1,0 +1,121 @@
+# pose_v4.yaml + smile_v3b.yaml 통합 실험용 스타일.
+# - 치아: 색(tooth_color)과 배열(alignment)을 분리 (smile_v3b, experiments.md 10장)
+# - 메이크업: makeup_style 범주형 1~5 (smile_v3b, 11.7장. makeup_intensity는 효과 없어 제외)
+# - pose: head_yaw / head_pitch, pose_v4의 강화된 pitch 문구 사용 (experiments.md 4.5장)
+# - 프롬프트 순서: 메이크업 -> pose -> 치아. 큰 변화(메이크업/pose)를 치아 줄보다 앞에 둬야
+#   delta 모드로 여러 control을 섞을 때 치아 강도가 pose/메이크업을 덮어쓰지 않는다 (experiments.md 4.5, 12.3).
+# - 주의 (experiments_preset.md 3장): head_yaw=0(turn_left)은 과회전(-47~-53도) 사례가 있었다.
+#   실제 사용 시 delta 모드로 head_yaw 25~75 범위를 먼저 시도하는 것을 권장.
+# - MICE(mask.mode: mice)를 쓸 때는 pose가 적용되지 않는다 (mice.global이 "keep head pose"로 고정).
+#   pose가 필요하면 preset/anchor/grid/delta 모드(mask.mode: composite 또는 off)를 쓴다.
+version: 1
+template_version: pose-makeup-v1
+base_template: |-
+  Edit image 1, a photo of this person. {reference_instructions}
+  Keep exactly the same person: face shape, facial proportions, eye shape, eyebrows, nose, lips, skin tone and skin texture, age, hairstyle, and accessories.
+  Keep the lighting, clothing, image quality, and background.
+  Makeup: {makeup_style}
+  Head yaw: {head_yaw}
+  Head pitch: {head_pitch}
+  Keep the facial expression and the mouth opening as in image 1 except for the requested head orientation.
+  Tooth alignment: {alignment}
+  Tooth color: {tooth_color}
+  Do not add, remove, enlarge, or reshape any tooth beyond the requested change. Keep the result anatomically plausible and photorealistic.
+layouts:
+  patient_only:
+    roles: [patient]
+    instruction: Apply only the changes described below.
+controls:
+  makeup_style:
+    default: 0
+    anchors:
+      "0": keep the person's original makeup unchanged
+      "1": "very light natural makeup: a slightly more even skin tone that keeps the natural skin texture, softly groomed natural eyebrows, and a sheer rosy lip tint"
+      "2": "light everyday makeup: a sheer coral lip tint and a very thin soft brown line close to the upper lashes, with no wing; keep the cheeks and skin unchanged"
+      "3": "soft pink makeup: a sheer soft pink lip tint and softly groomed natural eyebrows; keep the cheeks and skin unchanged"
+      "4": "polished natural event makeup: neatly defined natural eyebrows, a very soft sheer brown tint on the eyelids close to the lashes, and a rose lipstick; keep the cheeks and skin unchanged"
+      "5": "classic makeup: a soft matte red lipstick with clean natural lip edges and a very thin black line along the upper lashes, with no wing; keep the cheeks and skin unchanged"
+  head_yaw:
+    default: 50
+    anchors:
+      "0": turn the head clearly to the side so the face points toward the left edge of the image, a three-quarter view
+      "25": turn the head slightly so the face points a little toward the left edge of the image
+      "50": keep the head orientation exactly as in image 1
+      "75": turn the head slightly so the face points a little toward the right edge of the image
+      "100": turn the head clearly to the side so the face points toward the right edge of the image, a three-quarter view
+  head_pitch:
+    default: 50
+    anchors:
+      "0": tilt the head far down, chin pressed toward the chest, the camera sees the top of the head and the eyes look down
+      "25": tilt the head moderately down with the chin lowered
+      "50": keep the head tilt exactly as in image 1
+      "75": tilt the head moderately up with the chin raised
+      "100": tilt the head far back and up, chin raised high, the camera sees under the chin and the eyes look up
+  alignment:
+    default: 0
+    anchors:
+      "0": keep every tooth's shape, size, position, gaps, and arrangement exactly as in image 1
+      "25": move only the single most crooked or protruding tooth slightly back toward the dental arch
+      "50": move only the crooked, overlapping, or protruding teeth, such as a snaggletooth, back into line with the neighboring teeth
+      "75": straighten all crooked, overlapping, and protruding teeth into an even dental arch, like after orthodontic treatment
+      "100": straighten all crooked, overlapping, and protruding teeth into a neat, even, symmetric dental arch, like after complete orthodontic treatment
+  tooth_color:
+    default: 0
+    anchors:
+      "0": keep the exact original tooth color
+      "25": change only the color to a slightly brighter natural shade
+      "50": change only the color to a natural white shade
+      "75": change only the color to a bright white shade
+      "100": change only the color to a very bright cosmetic white shade
+presets:
+  natural: {}
+  whitening_only: {tooth_color: 100}
+  whitening_natural: {tooth_color: 50}
+  align_only: {alignment: 100}
+  align_snaggle: {alignment: 50}
+  align_whiten: {alignment: 100, tooth_color: 75}
+  makeup_natural: {makeup_style: 1}
+  makeup_coral: {makeup_style: 2}
+  makeup_pink: {makeup_style: 3}
+  makeup_formal: {makeup_style: 4}
+  makeup_classic: {makeup_style: 5}
+  turn_left: {head_yaw: 0}
+  turn_right: {head_yaw: 100}
+  look_up: {head_pitch: 100}
+  look_down: {head_pitch: 0}
+  white_turn_right: {tooth_color: 100, head_yaw: 100}
+  makeup_turn_right: {makeup_style: 2, head_yaw: 100}
+  align_whiten_turn_right: {alignment: 100, tooth_color: 75, head_yaw: 100}
+grids:
+  align_color:
+    attributes: [alignment, tooth_color]
+  yaw_pitch:
+    attributes: [head_yaw, head_pitch]
+mice:
+  global:
+    default: Edit image 1, a photo of this person. {reference_instructions} Keep exactly the same person, face, head pose, facial expression, mouth opening, lighting, clothing, and background. Change only what the separate region instructions describe.
+  regions:
+    teeth_white:
+      region: [teeth, inner_mouth]
+      prompt: Make these teeth a clean natural bright white color. Keep each tooth's shape, size, position, gaps, and arrangement exactly the same.
+    teeth_align:
+      region: [mouth]
+      prompt: Straighten the crooked, overlapping, or protruding teeth, such as a snaggletooth, into an even dental arch like after orthodontic treatment. Keep the tooth color, the lips, and the mouth opening the same.
+    teeth_align_white:
+      region: [mouth]
+      prompt: Straighten the crooked, overlapping, or protruding teeth into an even dental arch like after orthodontic treatment, and make the teeth a natural bright white. Keep the lips and the mouth opening the same.
+    lips_coral:
+      region: [lips]
+      prompt: Give these lips a sheer coral tint while keeping their natural texture, fine lines, and shape.
+    lips_red:
+      region: [lips]
+      prompt: Give these lips a soft matte red lipstick with natural texture and clean natural edges. Keep the lip shape.
+    lips_nude_gloss:
+      region: [lips]
+      prompt: Give these lips a sheer nude pink gloss with natural texture. Keep the lip shape.
+    eyes_liner:
+      region: [eyes]
+      prompt: Add a very thin, natural dark brown line close to the upper lashes, with no wing. Do not change the eye shape, the eyelids, the eye color, or the eyebrows.
+    eyes_smoky:
+      region: [eyes]
+      prompt: Add a very soft, sheer brown eyeshadow on the eyelids, blended naturally with no hard edges. Keep the eye shape, eye color, and eyebrows.
