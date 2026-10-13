@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--layout", action="append", default=[])
-    parser.add_argument("--kind", action="append", choices=("base", "preset", "anchor", "grid"), default=[])
+    parser.add_argument("--kind", action="append", choices=("base", "preset", "anchor", "grid", "mice"), default=[])
     parser.add_argument("--batch-size", type=positive_int, default=1)
     parser.add_argument("--max-sequence-length", type=positive_int, default=512)
     parser.add_argument("--text-encoder-out-layers", type=int, nargs="+", default=[9, 18, 27])

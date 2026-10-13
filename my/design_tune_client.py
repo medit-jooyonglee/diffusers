@@ -80,6 +80,9 @@ def build(server: str, style: str, layouts: list[str] | None, overwrite: bool, w
     if not response.ok:
         fail(response)
     job = response.json()
+    if job.get("skipped"):
+        print(f"{style}: already built for the current YAML content (skipped, use --overwrite to rebuild)")
+        return
     print(f"build job {job['job_id']} {job['status']}")
     started = time.time()
     while wait and job["status"] in {"queued", "running"}:

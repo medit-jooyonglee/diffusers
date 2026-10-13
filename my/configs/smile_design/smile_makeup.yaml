@@ -1,0 +1,66 @@
+# 치아 + 메이크업 동시 편집 기본 스타일 (MICE). docs/smile_tune/experiments.md 11장 결과 기반.
+# 영역별 지시문(mice.regions)을 MediaPipe 영역에 묶어 한 번에 생성하고, 편집 영역만 원본에 합성한다.
+# 권장 요청 (preset / mode 파라미터는 MICE에서는 쓰지 않음):
+#   {"mask": {"mode": "mice", "composite": true, "feather": 12, "dilate": 4,
+#             "edits": [{"prompt": "teeth_white"}, {"prompt": "lips_coral"}]}}
+#   레드 립 + 아이라인: edits = [{"prompt": "lips_red"}, {"prompt": "eyes_liner"}]
+# 볼(블러셔 / 광택)은 4 step 모델이 둥근 얼룩으로 그려서 넣지 않았다.
+# 한 프롬프트 메이크업 preset은 결과가 자연스러웠던 natural / coral만 남겼다 (mask: face, feather 12).
+version: 1
+template_version: smile-makeup-v1
+base_template: |-
+  Edit image 1, a photo of this person. {reference_instructions}
+  Keep exactly the same person: face shape, facial proportions, eye shape, nose, skin tone, age, hairstyle, and accessories.
+  Keep the head pose, facial expression, mouth opening, lighting, clothing, and background exactly as in image 1.
+  Makeup: {makeup_style}
+  Tooth color: {tooth_color}
+  Do not add, remove, enlarge, or reshape any tooth. Keep the result anatomically plausible and photorealistic.
+layouts:
+  patient_only:
+    roles: [patient]
+    instruction: Apply only the changes listed below.
+controls:
+  makeup_style:
+    default: 0
+    anchors:
+      "0": keep the person's original makeup unchanged
+      "1": very light natural makeup with a slightly more even skin tone that keeps the natural skin texture, softly groomed natural eyebrows, and a sheer rosy lip tint
+      "2": light everyday makeup with a sheer coral lip tint and a very thin soft brown line close to the upper lashes, with no wing; keep the cheeks and skin unchanged
+  tooth_color:
+    default: 0
+    anchors:
+      "0": keep the exact original tooth color
+      "50": change only the color to a natural white shade
+      "100": change only the color to a very bright cosmetic white shade
+presets:
+  natural: {}
+  makeup_natural:
+    makeup_style: 1
+  makeup_coral:
+    makeup_style: 2
+grids: {}
+mice:
+  global:
+    default: Edit image 1, a photo of this person. {reference_instructions} Keep exactly the same person, face, head pose, facial expression, mouth opening, lighting, clothing, and background. Change only what the separate region instructions describe.
+  regions:
+    teeth_white:
+      region: [teeth, inner_mouth]
+      prompt: Make these teeth a clean natural bright white color. Keep each tooth's shape, size, position, gaps, and arrangement exactly the same.
+    teeth_align_white:
+      region: [mouth]
+      prompt: Straighten the crooked, overlapping, or protruding teeth into an even dental arch like after orthodontic treatment, and make the teeth a natural bright white. Keep the lips and the mouth opening the same.
+    lips_nude_gloss:
+      region: [lips]
+      prompt: Give these lips a sheer nude pink gloss with natural texture. Keep the lip shape.
+    lips_coral:
+      region: [lips]
+      prompt: Give these lips a sheer coral tint while keeping their natural texture, fine lines, and shape.
+    lips_red:
+      region: [lips]
+      prompt: Give these lips a soft matte red lipstick with natural texture and clean natural edges. Keep the lip shape.
+    eyes_liner:
+      region: [eyes]
+      prompt: Add a very thin, natural dark brown line close to the upper lashes, with no wing. Do not change the eye shape, the eyelids, the eye color, or the eyebrows.
+    eyes_soft_shadow:
+      region: [eyes]
+      prompt: Add a very soft, sheer brown eyeshadow on the eyelids, blended naturally with no hard edges. Keep the eye shape, eye color, and eyebrows.

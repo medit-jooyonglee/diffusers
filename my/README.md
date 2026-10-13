@@ -110,6 +110,8 @@ nohup tensorboard \
   # --prompt "an old photo of a large house in the middle of a field" \
   # --prompt "the cover of the album santana by the band" \
 # export CUDA_VISIBLE_DEVICES=4,5 HF_HUB_OFFLINE=1 
+
+# my/samples/flux2_distillation_person_prompts_20000.jsonl
 export CUDA_VISIBLE_DEVICES=0 HF_HUB_OFFLINE=1 
 python my/predict_distillation.py \
   --student /data1/jooyonglee/training/diffuers/distillation/flux2-b1-t2i-b/checkpoint-222000/ \
@@ -286,13 +288,13 @@ CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1
 ~~~
 
 
-~~~ 
-CUDA_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 \
+~~~bash
+CUDA_VISIBLE_DEVICES=2 HF_HUB_OFFLINE=1 \
 python my/predict_distillation.py \
-  --student /data1/jooyonglee/training/diffuers/distillation/flux2/checkpoint-270000/ \
+  --student /data1/jooyonglee/training/diffuers/distillation/flux2-b1-t2i-b-person-scratch-v2/checkpoint-270000/ \
   --base-model /root/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-base-4B/snapshots/a3b4f4849157f664bdbc776fd7453c2783562f4d \
   --local-files-only \
-  --prompt-file my/samples/commoncatalog/prompts.txt \
+  --prompt-file my/samples/flux2_distillation_person_prompts_20000.jsonl \
   --num-images -1 \
   --steps 50 \
   --guidance-scale 4.0 \
@@ -302,7 +304,7 @@ python my/predict_distillation.py \
   --scheduler model \
   --dtype bf16 \
   --device cuda:0 \
-  --output-dir ./outputs/student
+  --output-dir ./outputs/student_person3
   ~~~
 
 
@@ -407,7 +409,7 @@ nohup env \
   PYTHONUNBUFFERED=1 \
   /opt/conda/envs/diffuser_lora/bin/accelerate launch \
     --num_processes 2 \
-    --main_process_port 29530 \
+    --main_process_port 29531 \
     --mixed_precision bf16 \
     my/mydisillation.py \
     --student_config my/student_configure_t2i_b.yaml \
@@ -418,7 +420,7 @@ nohup env \
     --resume_from_checkpoint latest \
     --train_batch_size 1 \
     --gradient_accumulation_steps 2 \
-    --max_train_steps 100000 \
+    --max_train_steps 1000000 \
     --learning_rate 2e-5 \
     --checkpointing_steps 5000 \
     --validation_steps 1000 \
@@ -436,3 +438,6 @@ nohup env \
     --local_files_only \
     > logs/t2i_b_person_scratch_v2_resume7gpu.log 2>&1 &
   ~~~
+<!-- 
+
+  nohup env CUDA_VISIBLE_DEVICES=4,5 HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1 /opt/conda/envs/diffuser_lora/bin/accelerate launch --num_processes 2 --main_process_port 29530 --mixed_precision bf16 my/mydisillation.py --student_config my/student_configure_t2i_b.yaml --cache_dir /data1/jooyonglee/public/flux2_teacher_cache/person_20000_base4b --teacher_model /root/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-base-4B/snapshots/a3b4f4849157f664bdbc776fd7453c2783562f4d --output_dir /data1/jooyonglee/training/diffuers/distillation/flux2-b1-t2i-b-person-scratch-v2 --max_train_samples 4998 --resume_from_checkpoint latest --train_batch_size 1 --gradient_accumulation_steps 2 --max_train_steps 100000 --learning_rate 2e-5 --checkpointing_steps 5000 --validation_steps 1000 --num_validation_images 6 --validation_prompt_file '' --validation_cache_dir /data1/jooyonglee/public/flux2_teacher_cache/person_20000_base4b --cfg_aware_probability 1.0 --cfg_aware_guidance_scale 4.0 --use_ema --ema_device gpu --ema_update_every 10 --gradient_checkpointing --allow_tf32 --dataloader_num_workers 2 --local_files_only > logs/t2i_b_person_scratch_v2_resume7gpu.log 2>&1 & -->

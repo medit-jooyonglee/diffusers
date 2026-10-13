@@ -1,0 +1,59 @@
+# 치아 + 고개 방향 기본 스타일. docs/smile_tune/experiments.md 4장 결과 기반.
+# - pose는 참조 이미지가 아니라 프롬프트 control로만 바꾼다 (참조 이미지 방식은 얼굴이 바뀌어 실패).
+# - pose 줄을 치아 줄보다 앞에 둔다 (뒤에 두면 delta 조합 시 치아 강도에 pose가 덮어써짐).
+# - pose를 바꿀 때는 마스크를 끈다 (원본 기준 마스크라 회전 결과가 잘림).
+# 권장 요청:
+#   조합 preset: {"mode": "preset", "preset": "white_turn_left", "mask": false}
+#   슬라이더:    {"mode": "delta", "control_values": {"head_yaw": 0, "tooth_color": 100}, "delta_strengths": {"head_yaw": 1, "tooth_color": 1}, "mask": false}
+# pose 강도는 x1 권장 (x3 이상은 오히려 정면으로 돌아오거나 얼굴이 무너짐). 37.5~62.5 구간은 거의 회전하지 않는다.
+version: 1
+template_version: smile-pose-v1
+base_template: |-
+  Edit image 1, a portrait photo of this person. {reference_instructions}
+  Keep exactly the same person: face shape, facial proportions, eye shape, eyebrows, nose, lips, skin tone and skin texture, age, hairstyle, makeup, and accessories.
+  Keep the lighting, clothing, image quality, and background.
+  Head yaw: {head_yaw}
+  Head pitch: {head_pitch}
+  Keep the facial expression as in image 1. Modify only the teeth and local mouth region as requested below, and the head orientation.
+  Tooth color: {tooth_color}
+  Do not add, remove, or reshape any tooth beyond the requested change. Keep the result anatomically plausible and photorealistic.
+layouts:
+  patient_only:
+    roles: [patient]
+    instruction: Apply the dental edit and the head orientation described below.
+controls:
+  head_yaw:
+    default: 50
+    anchors:
+      "0": turn the head clearly to the side so the face points toward the left edge of the image, a three-quarter view
+      "25": turn the head slightly so the face points a little toward the left edge of the image
+      "50": keep the head orientation exactly as in image 1
+      "75": turn the head slightly so the face points a little toward the right edge of the image
+      "100": turn the head clearly to the side so the face points toward the right edge of the image, a three-quarter view
+  head_pitch:
+    default: 50
+    anchors:
+      "0": tilt the head down with the chin lowered toward the chest
+      "25": tilt the head slightly down
+      "50": keep the head tilt exactly as in image 1
+      "75": tilt the head slightly up
+      "100": tilt the head up with the chin raised
+  tooth_color:
+    default: 0
+    anchors:
+      "0": keep the exact original tooth color
+      "50": change only the color to a natural white shade
+      "100": change only the color to a very bright cosmetic white shade
+presets:
+  natural: {}
+  whitening: {tooth_color: 100}
+  turn_left: {head_yaw: 0}
+  turn_right: {head_yaw: 100}
+  look_up: {head_pitch: 100}
+  look_down: {head_pitch: 0}
+  white_turn_left: {tooth_color: 100, head_yaw: 0}
+  white_turn_right: {tooth_color: 100, head_yaw: 100}
+  white_look_up: {tooth_color: 100, head_pitch: 100}
+grids:
+  yaw_pitch:
+    attributes: [head_yaw, head_pitch]

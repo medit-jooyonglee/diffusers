@@ -19,8 +19,16 @@ FACE_OVAL = [
     152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109,
 ]
 
+LEFT_EYE = [33, 246, 161, 160, 159, 158, 157, 173, 133, 155, 154, 153, 145, 144, 163, 7]
+RIGHT_EYE = [263, 466, 388, 387, 386, 385, 384, 398, 362, 382, 381, 380, 374, 373, 390, 249]
+LEFT_BROW = [70, 63, 105, 66, 107, 55, 65, 52, 53, 46]
+RIGHT_BROW = [300, 293, 334, 296, 336, 285, 295, 282, 283, 276]
+LEFT_CHEEK = [116, 117, 118, 101, 36, 205, 187, 123, 50]
+RIGHT_CHEEK = [345, 346, 347, 330, 266, 425, 411, 352, 280]
+
 # mouth = lips + inner_mouth, teeth = inner_mouth 중 밝은 픽셀 (Otsu)
-MASK_REGIONS = ("upper_lip", "lower_lip", "lips", "inner_mouth", "teeth", "mouth", "face")
+# eyes = 눈 윤곽 + 눈썹까지의 눈두덩 (아이라인 / 아이섀도), cheeks = 광대 랜드마크 다각형 (블러셔)
+MASK_REGIONS = ("upper_lip", "lower_lip", "lips", "inner_mouth", "teeth", "mouth", "face", "eyes", "cheeks")
 
 
 def parse_regions(value: Any) -> list[str]:
@@ -93,20 +101,26 @@ class FaceMasker:
         height, width = rgb.shape[:2]
         return np.array([[point.x * width, point.y * height] for point in result.face_landmarks[0]], np.int32)
 
-    def build(
-        self, image: Image.Image, regions: list[str], dilate: int = 0, feather: float = 0.0
-    ) -> tuple[Image.Image, dict[str, Any]]:
-        if dilate < 0 or feather < 0:
-            raise ValueError("mask dilate and feather must be non-negative")
+    def region_masks(self, image: Image.Image) -> tuple[dict[str, np.ndarray], np.ndarray]:
         points = self.landmarks(image)
         if points is None:
             raise ValueError("Mask requested but no face was detected in the patient image")
-
         rgb = np.asarray(image.convert("RGB"))
         empty = np.zeros(rgb.shape[:2], np.uint8)
         upper_lip = _polygon(empty.copy(), points, UPPER_LIP_OUTER + UPPER_LIP_INNER[::-1])
         lower_lip = _polygon(empty.copy(), points, LOWER_LIP_OUTER + LOWER_LIP_INNER[::-1])
         inner_mouth = _polygon(empty.copy(), points, UPPER_LIP_INNER + LOWER_LIP_INNER[::-1])
+        face_x = points[FACE_OVAL, 0]
+        face_width = int(face_x.max() - face_x.min())
+        eyes = empty.copy()
+        for eye, brow in ((LEFT_EYE, LEFT_BROW), (RIGHT_EYE, RIGHT_BROW)):
+            cv2.fillPoly(eyes, [cv2.convexHull(points[eye + brow].reshape(-1, 1, 2))], 255)
+        cheeks = empty.copy()
+        for cheek in (LEFT_CHEEK, RIGHT_CHEEK):
+            cv2.fillPoly(cheeks, [cv2.convexHull(points[cheek].reshape(-1, 1, 2))], 255)
+        # 블러셔 경계가 드러나지 않도록 볼 영역은 넓게 흐려서 가장자리를 0으로 수렴시킴
+        blur = max(3, int(face_width * 0.06)) | 1
+        cheeks = np.where(cv2.GaussianBlur(cheeks, (blur, blur), 0) > 127, 255, 0).astype(np.uint8)
         masks = {
             "upper_lip": upper_lip,
             "lower_lip": lower_lip,
@@ -115,14 +129,27 @@ class FaceMasker:
             "teeth": _teeth(rgb, inner_mouth),
             "mouth": upper_lip | lower_lip | inner_mouth,
             "face": _polygon(empty.copy(), points, FACE_OVAL),
+            "eyes": eyes,
+            "cheeks": cheeks,
         }
+        return masks, points
 
-        mask = empty
+    def union(self, masks: dict[str, np.ndarray], regions: list[str], dilate: int = 0) -> np.ndarray:
+        mask = np.zeros_like(next(iter(masks.values())))
         for region in regions:
             mask = mask | masks[region]
         if dilate:
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * dilate + 1, 2 * dilate + 1))
             mask = cv2.dilate(mask, kernel)
+        return mask
+
+    def build(
+        self, image: Image.Image, regions: list[str], dilate: int = 0, feather: float = 0.0
+    ) -> tuple[Image.Image, dict[str, Any]]:
+        if dilate < 0 or feather < 0:
+            raise ValueError("mask dilate and feather must be non-negative")
+        masks, points = self.region_masks(image)
+        mask = self.union(masks, regions, dilate)
         mask_image = Image.fromarray(mask, mode="L")
         if feather:
             mask_image = mask_image.filter(ImageFilter.GaussianBlur(radius=feather))

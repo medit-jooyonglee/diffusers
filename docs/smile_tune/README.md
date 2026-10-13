@@ -7,13 +7,15 @@ FLUX.2 Klein 4B 기반 Smile Design 튜닝 서버(`my/design_tune_server.py`)와
 - 클라이언트: 서버 API를 터미널에서 호출 (빌드 → 폴더 순차 추론까지 한 번에 가능)
 - 데스크톱 앱용 클라이언트 함수는 `my/temp/flux2_backend.py`에 있다 (마스크 옵션은 아직 미지원).
 - 스타일 / 프롬프트 / pose / 메이크업 실험 결과와 다음 실험 계획은 [experiments.md](experiments.md)에 있다.
+- 기본 스타일 3개의 preset별 결과 이미지와 수치는 [experiments_preset.md](experiments_preset.md)에 있다.
 
 ## 1. 구성 파일
 
 | 파일 | 역할 |
 | --- | --- |
 | `my/design_tune_server.py` | Flask 서버. 스타일 CRUD, 임베딩 빌드 job, 추론, 마스크 미리보기 |
-| `my/smile_design/face_mask.py` | MediaPipe Face Landmarker로 입술/치아/얼굴 영역 마스크 생성 |
+| `my/smile_design/face_mask.py` | MediaPipe Face Landmarker로 입술/치아/눈가/볼/얼굴 영역 마스크 생성 |
+| `my/smile_design/mice.py` | MICE 영역별 지시문 attention bias (5.2장) |
 | `my/design_tune_client.py` | 테스트용 CLI 클라이언트 (`health`, `styles`, `build`, `mask`, `infer`, `run`) |
 | `my/configs/smile_design/*.yaml` | 스타일 정의 (프롬프트 템플릿, layout, control, preset, grid) |
 | `my/build_smile_embedding_library.py` | 임베딩 빌더. 서버가 build 요청 시 별도 프로세스로 실행 |
@@ -49,7 +51,7 @@ python my/design_tune_server.py --port 5000 --device cuda:0
 | 옵션 | 기본값 | 설명 |
 | --- | --- | --- |
 | `--port` | `5000` | 데스크톱 앱 기본 주소(`http://10.100.1.45:8603`)에 맞추려면 `8603` |
-| `--device` | `cuda:0` | 추론 / 빌드에 쓸 GPU |
+| `--device` | `cuda:0` | 추론에 쓸 GPU (빌드도 기본은 같은 GPU) |
 | `--styles-dir` | `my/configs/smile_design` | 스타일 YAML 폴더 |
 | `--libraries-dir` | `outputs/design_tune_embedding_libraries` | 임베딩 라이브러리 저장 위치 |
 | `--steps` / `--guidance-scale` | `4` / `1.0` | 요청에서 `num_steps`, `guidance_scale`로 덮어쓸 수 있음 |
@@ -59,6 +61,7 @@ python my/design_tune_server.py --port 5000 --device cuda:0
 | `--mask-feather` | `12.0` | 마스크 경계 blur 반경 (픽셀) |
 | `--face-landmarker-model` | `weights/face_landmarker.task` | MediaPipe 모델 경로 |
 | `--fp8-weights` / `--no-fp8-weights` | on | transformer 가중치를 fp8로 **저장**하고 레이어별로 bf16으로 올려 계산 (9장 참고) |
+| `--build-device` | `--device`와 같음 | 임베딩 빌드용 GPU. 다르게 지정하면 빌드 중에도 추론 가능 (7.2장) |
 | `--build-timeout` | `7200` | 임베딩 빌드 제한 시간 (초) |
 
 ## 4. REST API
@@ -94,7 +97,15 @@ python my/design_tune_server.py --port 5000 --device cuda:0
 
 ## 5. 얼굴 마스크 옵션
 
-마스크를 켜면 전체 이미지를 생성한 뒤, **선택한 영역만** 원본 환자 사진 위에 합성한다.
+`parameters.mask.mode`로 두 방식을 고른다.
+
+| mode | 동작 |
+| --- | --- |
+| `composite` (기본) | 프롬프트 하나로 전체 이미지를 생성한 뒤, **선택한 영역만** 원본 환자 사진 위에 합성 (후처리) |
+| `mice` | 영역별 지시문을 attention bias로 각 영역에 묶어 한 번에 생성 (5.2장). `composite: true`면 생성 후 편집 영역만 원본에 합성 |
+
+### 5.1 composite
+
 마스크 밖은 원본 픽셀이 그대로 유지된다 (테스트에서 마스크 밖 픽셀 차이 0).
 
 요청별 지정 (`parameters.mask`):
@@ -115,6 +126,8 @@ python my/design_tune_server.py --port 5000 --device cuda:0
 | `teeth` | `inner_mouth` 중 밝고 붉지 않은 픽셀 (LAB 밝기 Otsu 후처리) |
 | `mouth` | `lips` + `inner_mouth` |
 | `face` | 얼굴 윤곽 |
+| `eyes` | 눈 윤곽 + 눈썹까지의 눈두덩 (아이라인 / 아이섀도용) |
+| `cheeks` | 광대 랜드마크 다각형 (블러셔용. 4 step 모델에서 볼 색이 얼룩지는 문제로 현재 스타일에서는 미사용) |
 
 동작 방식과 한계:
 
@@ -125,6 +138,60 @@ python my/design_tune_server.py --port 5000 --device cuda:0
 - 아주 가까운 클로즈업에서는 윗입술 다각형이 치아 끝을 살짝 덮을 수 있다.
 - `teeth`는 밝기 규칙이라 누렇거나 그늘진 치아는 놓칠 수 있다.
 - Face Landmarker는 CPU로 동작한다 (이미지당 약 10~30ms).
+
+### 5.2 MICE (영역별 지시문 동시 편집)
+
+논문 "Editing Everything Everywhere All at Once"(MICE, arXiv 2606.31278)의 방식을 논문 설명을 바탕으로 직접 구현했다
+(공개 저장소는 라이선스가 없어 코드를 가져오지 않았다). diffusers 코어는 수정하지 않는다.
+
+- 원리: transformer joint attention logits에 bias를 더한다 (`Softmax(QKᵀ/√d + B)`). 마스크를 토큰 격자(16px)로 줄여
+  - 영역 n 지시문 ↔ 영역 n 이미지 토큰만 연결
+  - 영역 n 이미지 토큰 → 다른 이미지 토큰: 영역 안 0, 멀어질수록 Gaussian 감쇠, 다른 영역 차단, **전역 지시문 차단**
+  - 전역 지시문 ↔ 배경(마스크 밖) 이미지 토큰
+- 토큰 순서: `[전역 지시문, 영역 1 지시문, ..., 생성 latent, 환자 참조 latent, 기타 참조 latent]`.
+  bias는 transformer forward pre-hook에서 실제 길이 / 격자를 읽어 만들고, 요청이 끝나면 hook을 제거한다
+  (**mice가 아닌 요청은 기존 속도 그대로**, 실측 4.58초 → mice 후에도 4.60초).
+- 마스크는 토큰 격자로 줄인 뒤 퍼뜨려 쓰므로 **경계가 픽셀 단위로 정밀할 필요는 없다**. 다만 치아 / 입술처럼 붙은 영역은
+  각 토큰이 50% 이상 덮은 영역 하나에 배정되므로 경계 위치에 따라 결과가 갈린다.
+- **MICE만으로는 배경 픽셀이 보존되지 않는다** (전체 재생성 특성, 배경 차이 11~23 / 0~255). 픽셀 보존이 필요하면 `composite: true`.
+
+YAML에 `mice` 섹션이 있어야 한다 (예: [configs/smile_v2_mice.yaml](configs/smile_v2_mice.yaml)). 빌드 시 `mice` 종류 임베딩이 함께 만들어진다.
+
+```yaml
+mice:
+  global:
+    default: "Edit image 1, a photo of this person. {reference_instructions} Keep exactly the same person, ..."
+  regions:
+    teeth_white: {region: [teeth, inner_mouth], prompt: "Make these teeth a clean natural bright white color. ..."}
+    lips_red:    {region: [lips], prompt: "Apply a vivid red lipstick to these lips. ..."}
+```
+
+요청 예시:
+
+```json
+{
+  "style_name": "smile_v2_mice",
+  "layout": "patient_only",
+  "seed": 0,
+  "mask": {
+    "mode": "mice",
+    "edits": [{"prompt": "teeth_white"}, {"prompt": "lips_red", "region": ["lips"]}],
+    "composite": true, "feather": 6, "dilate": 4
+  }
+}
+```
+
+| 옵션 | 기본값 | 설명 |
+| --- | --- | --- |
+| `edits` | (필수) | `{"prompt": 영역 지시문 이름, "region": 선택, "dilate": 선택}` 목록. `region` 생략 시 YAML 기본 영역 |
+| `global` | `default` | 전역 지시문 이름 |
+| `text_tokens` | 200 | 지시문당 텍스트 토큰 수 (padding 포함). `0`이면 실제 토큰만 사용 → **품질 저하** (치아 푸른빛, 색 번짐) |
+| `kernel_size` / `temperature` | 11 / 3.0 | 영역 경계 Gaussian 크기 / 감쇠 세기 (temperature 1~8에서 결과 차이는 작았음) |
+| `mice_steps` | 전체 | 앞 N 스텝에만 bias 적용 |
+| `composite` | false | 생성 후 편집 영역(합집합, dilate + feather)만 원본에 합성 |
+
+비용 (A6000, fp8, 약 1MP): 시간 **+35~43%** (4.0초 → 1영역 5.3초, 3영역 5.7초), 최대 VRAM **+0.3GB** (6.7 → 7.0GB).
+빠른 flash 커널 대신 bias를 지원하는 커널을 쓰기 때문이다.
 
 ## 6. 클라이언트 (`my/design_tune_client.py`)
 
@@ -165,13 +232,52 @@ $C run smile_v1 <입력폴더> <출력폴더> \
 
 서버 재시작은 필요 없다.
 
-- 라이브러리 경로는 `<libraries-dir>/<style 이름>/<YAML 내용 SHA256>`이다. 프롬프트를 한 글자만 바꿔도 새 경로가 된다.
-- 빌드가 끝나기 전에는 해당 스타일 추론이 409 (`Embedding library is not built`)를 반환한다. 이전 라이브러리를 자동으로 쓰지 않는다.
-- 빌드가 끝나면 다음 요청부터 바로 새 임베딩이 쓰인다 (서버는 요청마다 라이브러리를 새로 연다).
+### 7.1 스타일과 임베딩 라이브러리 일치
+
+- 라이브러리 경로는 `<libraries-dir>/<YAML 파일 이름>/<YAML 내용 SHA256>`이다.
+  - 요청에 `smile_v1`, `smile-v1`(template_version) 중 무엇을 써도 같은 YAML로 해석되어 같은 경로를 쓴다
+    (이전에는 요청 이름이 경로에 그대로 들어가 표기가 다르면 409가 났다 → 수정됨).
+  - SHA256은 YAML을 파싱한 내용 기준이라 **주석 / 공백 변경은 재빌드가 필요 없다.**
+  - 프롬프트, control, preset, layout, mice 영역 중 하나라도 바뀌면 새 경로가 되어 **재빌드가 필요하다.**
+- 빌드 여부 확인: `GET /api/v1/styles`의 `library_ready` (클라이언트 `styles` 명령의 `ready=True/False`).
+  현재 YAML 내용의 해시 경로에 manifest가 있는지로 판단한다.
+- 중복 빌드 방지 (`POST /api/v1/styles/{name}/build`):
+  - 현재 YAML 내용으로 이미 다 빌드되어 있으면 빌드 프로세스를 띄우지 않고 **200 + `"skipped": true`**로 바로 응답한다.
+  - 같은 라이브러리를 빌드 중이면 새 작업 대신 **진행 중인 작업**을 돌려준다 (동시 3회 요청 → 작업 1개, 빌드 프로세스 1개 확인).
+  - 강제로 다시 빌드하려면 `{"overwrite": true}` (클라이언트 `--overwrite`).
+- 재빌드 전에는 해당 스타일 추론이 409 (`Embedding library is not built`, 응답에 `build_endpoint` 포함)를 반환한다.
+  이전 라이브러리를 자동으로 쓰지 않으므로 "YAML은 바뀌었는데 예전 임베딩으로 추론"되는 불일치는 생기지 않는다.
+- 빌드가 끝나면 다음 요청부터 바로 새 임베딩이 쓰인다 (서버 재시작 불필요, 요청마다 라이브러리를 새로 연다).
+- 라이브러리 manifest에 서버 모델 경로가 기록되어, 다른 모델로 빌드한 라이브러리는 409로 거부한다.
 - YAML을 이전 내용으로 되돌리면 이전 라이브러리를 재빌드 없이 다시 쓴다.
-- 스타일 이름은 빌드와 추론에서 **같은 표기**를 쓴다. 경로에 요청한 이름이 그대로 들어가므로
-  `smile_v1`로 빌드하고 `smile-v1`로 추론하면 409가 난다.
-- 빌드 중에는 GPU 락 때문에 **다른 스타일의 추론도 빌드가 끝날 때까지 대기**한다.
+- 이전 해시의 라이브러리는 **자동 삭제되지 않는다** (스타일 하나 약 0.1~1.8GB). 실험이 끝나면 정리한다.
+- 최종 배포에서 YAML을 고정한다면 라이브러리를 미리 빌드해 함께 배포하고, `PUT` / `build` API를 막으면 된다.
+
+### 7.2 빌드 중 VRAM과 반환
+
+- 빌드는 서버와 **별도 프로세스**(`my/build_smile_embedding_library.py`)에서 text encoder(Qwen3 4B)를 올려 실행한다.
+  프로세스가 끝나면 그 VRAM은 **전부 반환**된다 (서버 프로세스에는 text encoder가 남지 않는다).
+- 실측 (A6000, 같은 GPU): 서버만 8.9GB → 빌드 중 최대 17.3GB (+8.3GB, 프롬프트 수에 따라 10~14초) → 빌드 후 8.9GB.
+- 같은 GPU에서 빌드하면 GPU 락 때문에 **빌드가 끝날 때까지 다른 추론이 대기**한다.
+- `--build-device`로 빌드를 다른 GPU에서 돌리면 락을 잡지 않아 **빌드 중에도 추론이 된다** (실측: 빌드 중 추론 4.6초 정상 처리).
+  빌드 서브프로세스는 서버의 `CUDA_VISIBLE_DEVICES`를 물려받으므로 두 GPU를 모두 보이게 띄운다:
+
+```bash
+CUDA_VISIBLE_DEVICES=2,3 python my/design_tune_server.py --device cuda:0 --build-device cuda:1
+```
+
+### 7.3 기본 스타일
+
+`my/configs/smile_design/`에 실험 결과를 반영한 기본 스타일 3개가 있다. 각 YAML 상단 주석에 권장 요청이 있다.
+
+| 파일 | 용도 | 권장 요청 | 빌드 (고유 프롬프트 / 용량) |
+| --- | --- | --- | --- |
+| `smile_teeth.yaml` | 치아 미백 / 교정 | `preset` (`whitening_only`, `align_snaggle`, `align_only`, `align_whiten`) + composite 마스크 (`teeth+inner_mouth` 또는 `mouth`) | 50개 / 약 0.4GB (layout 2개) |
+| `smile_makeup.yaml` | 치아 + 입술 + 눈가 동시 | `mask.mode: mice`, `composite: true`, edits: `teeth_white`, `teeth_align_white`, `lips_nude_gloss` / `lips_coral` / `lips_red`, `eyes_liner` / `eyes_soft_shadow` | 13개 / 약 0.1GB |
+| `smile_pose.yaml` | 치아 + 고개 방향 | `preset` (`turn_left`, `white_look_up` 등) 또는 `delta`, **마스크 off** | 30개 / 약 0.24GB |
+| `smile_v1.yaml` | 초기 스타일 (실험 기준) | – | 228개 / 1.8GB |
+
+![default styles](assets/default_styles.jpg)
 
 ## 8. 성능 / 용량 (RTX A6000 기준 측정값)
 

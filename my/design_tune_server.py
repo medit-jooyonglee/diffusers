@@ -20,12 +20,13 @@ from typing import Any
 import torch
 import yaml
 from flask import Flask, Response, jsonify, request, send_file
-from PIL import Image, ImageOps, PngImagePlugin
+from PIL import Image, ImageFilter, ImageOps, PngImagePlugin
 
 from diffusers import Flux2KleinPipeline
 
 from smile_design.embedding_library import EmbeddingLibrary
 from smile_design.face_mask import MASK_REGIONS, FaceMasker, parse_regions
+from smile_design.mice import MiceAttention, MiceEdit, PromptLengthCounter
 from smile_design.inference import load_transformer_override
 from smile_design.prompt_templates import build_prompt_entries, load_experiment_config, reference_roles
 
@@ -71,12 +72,22 @@ def torch_dtype(name: str) -> torch.dtype:
 
 
 def resolve_mask_options(value: Any, args: argparse.Namespace) -> dict[str, Any]:
-    # 요청의 parameters.mask: 생략하면 서버 기본값, true/false, 또는 {"enabled", "regions", "dilate", "feather"}
+    # 요청의 parameters.mask: 생략하면 서버 기본값, true/false, 또는 옵션 객체
+    # mode "composite": 전체 생성 후 regions 영역만 원본에 합성
+    # mode "mice": edits(영역별 지시문)를 attention bias로 영역에 묶어 한 번에 생성 (smile_design/mice.py)
     options = {
         "enabled": args.mask,
+        "mode": "composite",
         "regions": parse_regions(args.mask_regions),
         "dilate": args.mask_dilate,
         "feather": args.mask_feather,
+        "edits": [],
+        "global": "default",
+        "kernel_size": 11,
+        "temperature": 3.0,
+        "mice_steps": None,
+        "composite": False,
+        "text_tokens": 200,
     }
     if value is None:
         return options
@@ -97,6 +108,22 @@ def resolve_mask_options(value: Any, args: argparse.Namespace) -> dict[str, Any]
         options["dilate"] = int(value["dilate"])
     if "feather" in value:
         options["feather"] = float(value["feather"])
+    if "mode" in value:
+        if value["mode"] not in ("composite", "mice"):
+            raise ValueError("mask.mode must be 'composite' or 'mice'")
+        options["mode"] = value["mode"]
+    if options["mode"] == "mice":
+        edits = value.get("edits")
+        if not isinstance(edits, list) or not edits or not all(isinstance(e, dict) and "prompt" in e for e in edits):
+            raise ValueError('mask.edits must be a non-empty list of {"prompt": name, "region": optional}')
+        options["edits"] = edits
+        options["global"] = str(value.get("global", options["global"]))
+        options["kernel_size"] = int(value.get("kernel_size", options["kernel_size"]))
+        options["temperature"] = float(value.get("temperature", options["temperature"]))
+        options["mice_steps"] = None if value.get("mice_steps") is None else int(value["mice_steps"])
+        options["composite"] = bool(value.get("composite", False))
+        # 지시문당 사용할 텍스트 토큰 수 (padding 포함). 0이면 실제 토큰만 사용 (품질이 떨어짐, 실험 결과)
+        options["text_tokens"] = int(value.get("text_tokens", options["text_tokens"]))
     return options
 
 
@@ -208,7 +235,8 @@ class StyleStore:
         safe_style_name(name)
         path = style_path or self.resolve(name)
         _, config_hash = load_experiment_config(path)
-        return self.libraries_dir / name / config_hash
+        # 요청 이름(smile_v1 / smile-v1 / template_version)과 무관하게 YAML 파일 이름으로 경로를 통일
+        return self.libraries_dir / path.stem / config_hash
 
 
 @dataclass
@@ -223,6 +251,7 @@ class BuildJob:
     return_code: int | None = None
     error: str | None = None
     log: str = ""
+    skipped: bool = False  # 이미 빌드된 라이브러리라 빌드 프로세스를 띄우지 않음
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -230,6 +259,7 @@ class BuildJob:
             "style_name": self.style_name,
             "library": self.library,
             "status": self.status,
+            "skipped": self.skipped,
             "created_at": self.created_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
@@ -237,6 +267,24 @@ class BuildJob:
             "error": self.error,
             "log": self.log,
         }
+
+
+def _library_complete(library: Path, config: dict[str, Any], layouts: list[str] | None, kinds: list[str] | None) -> bool:
+    """manifest에 요청 범위의 모든 항목이 있고 파일도 남아 있으면 True."""
+    manifest_path = library / "manifest.json"
+    if not manifest_path.is_file():
+        return False
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        expected = build_prompt_entries(config, layouts=layouts, kinds=set(kinds) if kinds else None)
+    except (ValueError, json.JSONDecodeError):
+        return False
+    entries = manifest.get("entries", {})
+    for entry in expected:
+        record = entries.get(entry.entry_id)
+        if record is None or record.get("prompt") != entry.prompt or not (library / record["file"]).is_file():
+            return False
+    return (library / manifest.get("negative_embedding", "negative.pt")).is_file()
 
 
 class BuildManager:
@@ -259,7 +307,7 @@ class BuildManager:
             if unknown:
                 raise ValueError(f"Unknown layouts: {sorted(unknown)}")
         if kinds is not None:
-            allowed = {"base", "preset", "anchor", "grid"}
+            allowed = {"base", "preset", "anchor", "grid", "mice"}
             if not isinstance(kinds, list) or not all(isinstance(item, str) for item in kinds):
                 raise ValueError("kinds must be a list of strings")
             unknown = set(kinds) - allowed
@@ -268,11 +316,23 @@ class BuildManager:
         batch_size = int(options.get("batch_size", self.args.build_batch_size))
         if batch_size < 1:
             raise ValueError("batch_size must be at least 1")
-        job = BuildJob(uuid.uuid4().hex, style_name, str(library))
+        overwrite = bool(options.get("overwrite", False))
+        with self.lock:
+            # 같은 라이브러리(= 같은 YAML 내용)를 빌드 중이면 새 프로세스를 띄우지 않고 그 작업을 돌려준다
+            for existing in self.jobs.values():
+                if existing.library == str(library) and existing.status in {"queued", "running"}:
+                    return existing
+            if not overwrite and _library_complete(library, config, layouts, kinds):
+                job = BuildJob(uuid.uuid4().hex, style_name, str(library), status="succeeded", skipped=True)
+                job.started_at = job.finished_at = utc_now()
+                job.log = "Embedding library is already built for this style content; use overwrite to rebuild"
+                self.jobs[job.job_id] = job
+                return job
+            # 확인과 등록을 같은 락 안에서 해야 동시 요청이 둘 다 통과하지 않는다
+            job = BuildJob(uuid.uuid4().hex, style_name, str(library))
+            self.jobs[job.job_id] = job
         snapshot_path = library / "style.yaml"
         atomic_write_text(snapshot_path, style_content)
-        with self.lock:
-            self.jobs[job.job_id] = job
         thread = threading.Thread(
             target=self._run,
             args=(
@@ -281,7 +341,7 @@ class BuildManager:
                 layouts or [],
                 kinds or [],
                 batch_size,
-                bool(options.get("overwrite", False)),
+                overwrite,
             ),
             daemon=True,
             name=f"embedding-build-{job.job_id[:8]}",
@@ -323,7 +383,7 @@ class BuildManager:
             "--dtype",
             self.args.dtype,
             "--device",
-            self.args.device,
+            self.args.build_device or self.args.device,
         ]
         if self.args.local_files_only:
             command.append("--local-files-only")
@@ -336,7 +396,10 @@ class BuildManager:
         if overwrite:
             command.append("--overwrite")
         try:
-            lock = self.gpu_lock or threading.RLock()
+            # 빌드는 별도 프로세스라 종료 시 text encoder VRAM이 모두 반환된다.
+            # 추론과 같은 GPU에서 빌드할 때만 GPU 락을 잡는다 (다른 GPU면 빌드 중에도 추론 가능)
+            same_device = (self.args.build_device or self.args.device) == self.args.device
+            lock = (self.gpu_lock if same_device else None) or threading.RLock()
             with lock:
                 completed = subprocess.run(
                     command,
@@ -374,6 +437,7 @@ class InferenceEngine:
         self.pipeline: Flux2KleinPipeline | None = None
         self.lock = threading.RLock()
         self.masker = FaceMasker(args.face_landmarker_model)
+        self.prompt_length: PromptLengthCounter | None = None
 
     @property
     def loaded(self) -> bool:
@@ -430,13 +494,17 @@ class InferenceEngine:
         if len(images) != len(roles):
             raise ValueError(f"Layout {layout!r} requires {len(roles)} images in order {roles}, got {len(images)}")
         mask_options = resolve_mask_options(parameters.get("mask"), self.args)
-        mask_image, mask_metadata = None, {"enabled": False}
-        if mask_options["enabled"]:
-            # 생성 전에 마스크를 만들어 얼굴이 없으면 GPU 추론 없이 바로 실패
-            mask_image, mask_metadata = self.masker.build(
-                images[0], mask_options["regions"], mask_options["dilate"], mask_options["feather"]
-            )
-        prompt_embeds, mix = self._embedding(library, layout, parameters)
+        mask_image, mask_metadata, mice = None, {"enabled": False}, None
+        if mask_options["enabled"] and mask_options["mode"] == "mice":
+            mice, mask_image, mask_metadata = self._mice(library, config, layout, images[0], mask_options)
+            prompt_embeds, mix = mice.prompt_embeds, {"mode": "mice"}
+        else:
+            if mask_options["enabled"]:
+                # 생성 전에 마스크를 만들어 얼굴이 없으면 GPU 추론 없이 바로 실패
+                mask_image, mask_metadata = self.masker.build(
+                    images[0], mask_options["regions"], mask_options["dilate"], mask_options["feather"]
+                )
+            prompt_embeds, mix = self._embedding(library, layout, parameters)
         original_size = images[0].size
         width, height = internal_size(
             original_size[0], original_size[1], self.args.dimension_multiple, self.args.max_generation_area
@@ -464,7 +532,12 @@ class InferenceEngine:
             "generator": generator,
         }
         with self.lock, torch.inference_mode():
-            generated = pipeline(**call_kwargs).images[0]
+            hook = mice.install(pipeline.transformer) if mice else None
+            try:
+                generated = pipeline(**call_kwargs).images[0]
+            finally:
+                if hook is not None:
+                    hook.remove()
         if generated.size != original_size:
             generated = generated.resize(original_size, Image.Resampling.LANCZOS)
         if mask_image is not None:
@@ -485,6 +558,61 @@ class InferenceEngine:
             "mask": mask_metadata,
         }
         return generated, metadata
+
+    def _mice(
+        self,
+        library: EmbeddingLibrary,
+        config: dict[str, Any],
+        layout: str,
+        image: Image.Image,
+        options: dict[str, Any],
+    ) -> tuple[MiceAttention, Image.Image | None, dict[str, Any]]:
+        regions_config = config.get("mice", {}).get("regions", {})
+        if not regions_config:
+            raise ValueError("This style has no mice section; add mice.global / mice.regions and rebuild")
+        if not options["text_tokens"] and self.prompt_length is None:
+            self.prompt_length = PromptLengthCounter(self.args.text_encoder_model)
+
+        def trimmed(entry_id: str) -> torch.Tensor:
+            embeds = library.load(entry_id, self.args.device, self.dtype)
+            if options["text_tokens"]:
+                return embeds[:, : options["text_tokens"]]
+            return embeds[:, : self.prompt_length(library.prompt_for(entry_id), embeds.shape[1])]
+
+        masks, _ = self.masker.region_masks(image)
+        edits, union, edit_metadata = [], None, []
+        for edit in options["edits"]:
+            name = str(edit["prompt"])
+            if name not in regions_config:
+                raise ValueError(f"Unknown mice region prompt {name!r}; choose from {sorted(regions_config)}")
+            regions = parse_regions(edit.get("region", regions_config[name]["region"]))
+            mask = self.masker.union(masks, regions, int(edit.get("dilate", options["dilate"])))
+            edits.append(MiceEdit(mask, trimmed(f"{layout}/mice/region/{name}")))
+            union = mask if union is None else union | mask
+            edit_metadata.append({"prompt": name, "regions": regions, "mask_pixels": int((mask > 0).sum())})
+        mice = MiceAttention(
+            trimmed(f"{layout}/mice/global/{options['global']}"),
+            edits,
+            kernel_size=options["kernel_size"],
+            temperature=options["temperature"],
+            steps=options["mice_steps"],
+        )
+        mask_image = None
+        if options["composite"]:
+            mask_image = Image.fromarray(union, mode="L").filter(ImageFilter.GaussianBlur(radius=options["feather"]))
+        metadata = {
+            "enabled": True,
+            "mode": "mice",
+            "global": options["global"],
+            "edits": edit_metadata,
+            "kernel_size": options["kernel_size"],
+            "temperature": options["temperature"],
+            "mice_steps": options["mice_steps"],
+            "composite": options["composite"],
+            "text_tokens_per_prompt": options["text_tokens"],
+            "text_tokens": int(mice.prompt_embeds.shape[1]),
+        }
+        return mice, mask_image, metadata
 
     def _embedding(
         self,
@@ -692,7 +820,7 @@ def create_app(args: argparse.Namespace | None = None) -> Flask:
             return json_error(str(error), 404)
         except ValueError as error:
             return json_error(str(error), 400)
-        return jsonify(job.as_dict()), 202
+        return jsonify(job.as_dict()), 200 if job.skipped else 202
 
     @app.get("/api/v1/jobs/<job_id>")
     def get_job(job_id: str):
@@ -765,6 +893,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--libraries-dir", type=Path, default=ROOT / "outputs" / "design_tune_embedding_libraries"
     )
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--build-device",
+        help="GPU for embedding builds (text encoder, about 8GB peak). Default: same as --device, which blocks inference while building",
+    )
     parser.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
     parser.add_argument("--steps", type=parse_positive_int, default=4)
     parser.add_argument("--guidance-scale", type=float, default=1.0)

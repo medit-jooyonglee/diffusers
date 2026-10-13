@@ -1,0 +1,127 @@
+version: 1
+template_version: smile-v2-mice
+base_template: 'Edit image 1, a photo of this person. {reference_instructions}
+
+  Keep exactly the same person: face shape, facial proportions, eye shape, nose, skin tone, age, hairstyle, and accessories.
+
+  Keep the head pose, facial expression, mouth opening, lighting, clothing, and background exactly as in image 1.
+
+  Makeup: {makeup_style}
+
+  Makeup intensity: {makeup_intensity}
+
+  Tooth alignment: {alignment}
+
+  Tooth color: {tooth_color}
+
+  Do not add, remove, enlarge, or reshape any tooth beyond the requested change. Keep the result anatomically plausible and photorealistic.'
+layouts:
+  patient_only:
+    roles:
+    - patient
+    instruction: Apply only the changes listed below.
+controls:
+  tooth_color:
+    default: 0
+    anchors:
+      '0': keep the exact original tooth color
+      '25': change only the color to a slightly brighter natural shade
+      '50': change only the color to a natural white shade
+      '75': change only the color to a bright white shade
+      '100': change only the color to a very bright cosmetic white shade
+  alignment:
+    default: 0
+    anchors:
+      '0': keep every tooth's shape, size, position, gaps, and arrangement exactly as in image 1
+      '25': move only the single most crooked or protruding tooth slightly back toward the dental arch
+      '50': move only the crooked, overlapping, or protruding teeth, such as a snaggletooth, back into line with the neighboring teeth
+      '75': straighten all crooked, overlapping, and protruding teeth into an even dental arch, like after orthodontic treatment
+      '100': straighten all crooked, overlapping, and protruding teeth into a neat, even, symmetric dental arch, like after complete orthodontic treatment
+  makeup_style:
+    default: 0
+    anchors:
+      '0': keep the person's original makeup unchanged
+      '1': natural no-makeup look with an even skin tone, softly groomed natural eyebrows, and a my-lips-but-better rosy lip tint
+      '2': daily coral look with thin brown eyeliner, soft coral blush, and coral lipstick
+      '3': glowing dewy skin look with subtle highlighter on the cheekbones and a glossy nude pink lip
+      '4': formal wedding look with defined eyebrows, soft brown smoky eyeshadow, rose lipstick, and semi-matte skin
+      '5': bold glam look with a sharp winged black eyeliner and vivid red lipstick
+  makeup_intensity:
+    default: 50
+    anchors:
+      '0': no visible makeup change
+      '50': moderate, natural-looking application
+      '100': full, clearly visible application
+presets:
+  natural:
+    tooth_color: 0
+  whitening_only:
+    tooth_color: 100
+  whitening_natural:
+    tooth_color: 50
+  align_only:
+    alignment: 100
+  align_snaggle:
+    alignment: 50
+  align_whiten:
+    alignment: 100
+    tooth_color: 75
+  makeup_natural:
+    makeup_style: 1
+  makeup_coral:
+    makeup_style: 2
+  makeup_glow:
+    makeup_style: 3
+  makeup_formal:
+    makeup_style: 4
+  makeup_glam:
+    makeup_style: 5
+  glow_whiten:
+    makeup_style: 3
+    tooth_color: 75
+grids:
+  align_color:
+    attributes:
+    - alignment
+    - tooth_color
+mice:
+  global:
+    default: Edit image 1, a photo of this person. {reference_instructions} Keep exactly the same person, face, head pose, facial expression, mouth opening, lighting, clothing, and background. Change only what the separate region instructions describe.
+  regions:
+    teeth_white:
+      region:
+      - teeth
+      - inner_mouth
+      prompt: Make these teeth a clean natural bright white color. Keep each tooth's shape, size, position, gaps, and arrangement exactly the same.
+    teeth_align:
+      region:
+      - mouth
+      prompt: Straighten the crooked, overlapping, or protruding teeth, such as a snaggletooth, into an even dental arch like after orthodontic treatment. Keep the tooth color, the lips, and the mouth opening the same.
+    teeth_align_white:
+      region:
+      - mouth
+      prompt: Straighten the crooked, overlapping, or protruding teeth into an even dental arch like after orthodontic treatment, and make the teeth a natural bright white. Keep the lips and the mouth opening the same.
+    lips_coral:
+      region:
+      - lips
+      prompt: Apply a sheer coral lipstick to these lips. Keep the lip shape the same.
+    lips_red:
+      region:
+      - lips
+      prompt: Apply a vivid red lipstick to these lips. Keep the lip shape the same.
+    lips_nude_gloss:
+      region:
+      - lips
+      prompt: Apply a glossy nude pink lip gloss to these lips. Keep the lip shape the same.
+    eyes_liner:
+      region:
+      - eyes
+      prompt: Add a thin sharp black winged eyeliner along the upper eyelids. Keep the eye shape, eye color, and eyebrows the same.
+    eyes_smoky:
+      region:
+      - eyes
+      prompt: Add a soft brown smoky eyeshadow on the eyelids. Keep the eye shape, eye color, and eyebrows the same.
+    cheeks_blush:
+      region:
+      - cheeks
+      prompt: Add a subtle, sheer soft pink blush on the cheeks that blends naturally into the skin.

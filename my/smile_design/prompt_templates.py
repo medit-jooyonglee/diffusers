@@ -60,6 +60,8 @@ def load_experiment_config(path: str | Path) -> tuple[dict[str, Any], str]:
         unknown = set(attributes) - set(config["controls"])
         if unknown:
             raise ValueError(f"Grid {name!r} references unknown controls: {sorted(unknown)}")
+    if "mice" in config:
+        _validate_mice(config["mice"])
     canonical = json.dumps(config, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return config, hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -92,8 +94,9 @@ def build_prompt_entries(
     unknown_layouts = set(selected_layouts) - set(config["layouts"])
     if unknown_layouts:
         raise ValueError(f"Unknown reference layouts: {sorted(unknown_layouts)}")
-    selected_kinds = kinds or {"base", "preset", "anchor", "grid"}
-    unknown_kinds = selected_kinds - {"base", "preset", "anchor", "grid"}
+    all_kinds = {"base", "preset", "anchor", "grid"} | ({"mice"} if "mice" in config else set())
+    selected_kinds = kinds or all_kinds
+    unknown_kinds = selected_kinds - all_kinds
     if unknown_kinds:
         raise ValueError(f"Unknown entry kinds: {sorted(unknown_kinds)}")
     entries: list[PromptEntry] = []
@@ -130,6 +133,14 @@ def build_prompt_entries(
                     suffix = f"{format_slider_value(first_value)}_{format_slider_value(second_value)}"
                     entry_id = f"{layout}/grid/{grid_name}/{suffix}"
                     entries.append(_entry(config, layout, "grid", entry_id, values, grid=grid_name))
+        if "mice" in selected_kinds:
+            # MICE: 전역 지시문과 영역별 지시문을 각각 독립된 임베딩으로 빌드 (추론 시 이어 붙임)
+            instruction = config["layouts"][layout]["instruction"].strip()
+            for name, text in config["mice"]["global"].items():
+                prompt = text.format(reference_instructions=instruction).strip()
+                entries.append(PromptEntry(f"{layout}/mice/global/{name}", "mice", layout, prompt, {}))
+            for name, region in config["mice"]["regions"].items():
+                entries.append(PromptEntry(f"{layout}/mice/region/{name}", "mice", layout, region["prompt"].strip(), {}))
     ids = [entry.entry_id for entry in entries]
     if len(ids) != len(set(ids)):
         raise ValueError("Generated prompt entry IDs are not unique")
@@ -183,6 +194,19 @@ def _validate_values(config: dict[str, Any], values: dict[str, Any]) -> dict[str
         if not low <= value <= high:
             raise ValueError(f"Control {name!r} must be between {low} and {high}, got {value}")
     return normalized
+
+
+def _validate_mice(mice: Any) -> None:
+    if not isinstance(mice, dict) or not isinstance(mice.get("global"), dict) or not mice["global"]:
+        raise ValueError("mice.global must be a non-empty mapping of name to prompt")
+    if not isinstance(mice.get("regions"), dict) or not mice["regions"]:
+        raise ValueError("mice.regions must be a non-empty mapping")
+    for name, text in mice["global"].items():
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError(f"mice.global.{name} must be a non-empty string")
+    for name, region in mice["regions"].items():
+        if not isinstance(region, dict) or not isinstance(region.get("prompt"), str) or not region.get("region"):
+            raise ValueError(f"mice.regions.{name} requires prompt and region")
 
 
 def _anchor_text(anchors: dict[float, str], value: float) -> str:
