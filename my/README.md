@@ -1,3 +1,10 @@
+## Smile Design 추론 서버 (design_tune_server.py)
+
+코드가 어디서 분기되고 파라미터가 어디로 흘러가는지(디버깅용 core 로직 요약)는
+[docs/smile_tune/core_architecture.md](../docs/smile_tune/core_architecture.md) 참고.
+실험 결과는 [docs/smile_tune/final_report.md](../docs/smile_tune/final_report.md), API 사용법은
+[docs/smile_tune/README.md](../docs/smile_tune/README.md).
+
 ### 학습 distillation 데이터 구축
 
 

@@ -1,0 +1,56 @@
+version: 1
+
+architecture:
+  num_layers: 5
+  num_single_layers: 16
+  hidden_size: 1792
+  double_layer_mapping: [0, 1, 2, 3, 4]
+  single_layer_mapping: [0, 1, 3, 4, 5, 6, 8, 9, 10, 11, 13, 14, 15, 16, 18, 19]
+  mapping_strategy: manual
+  random_init: false
+
+distillation:
+  lambda_gt: 0.05
+  lambda_kd: 0.0
+  lambda_flow: 1.0
+  lambda_hidden: 0.25
+  lambda_direction: 0.05
+  lambda_trajectory: 1.0
+  trajectory_probability: 0.20
+  trajectory_rollout_steps: 2
+  trajectory_num_inference_steps: 50
+  trajectory_warmup_steps: 1000
+  cfg_aware_probability: 0.50
+  cfg_aware_guidance_scale: 4.0
+  cfg_aware_warmup_steps: 0
+  hidden_double_layers: [0, 2, 4]
+  hidden_single_layers: [0, 4, 8, 12, 15]
+  unconditional_probability: 0.10
+  weighting_scheme: logit_normal
+  logit_mean: 0.0
+  logit_std: 1.0
+
+data:
+  max_train_samples: 1000000
+
+optimization:
+  learning_rate: 2.0e-5
+  lr_scheduler: constant_with_warmup
+  lr_warmup_steps: 500
+  use_ema: true
+  ema_device: cpu
+  ema_decay: 0.9999
+  ema_update_every: 10
+  ema_update_after_step: 0
+  ema_use_warmup: true
+  ema_inv_gamma: 1.0
+  ema_power: 0.75
+
+validation:
+  num_inference_steps: 50
+  guidance_scale: 4.0
+  height: 512
+  width: 512
+  num_images: 10
+  prompt_file: my/samples/commoncatalog/prompts.txt
+  encoding_batch_size: 1

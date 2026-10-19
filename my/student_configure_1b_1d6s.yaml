@@ -1,0 +1,27 @@
+version: 1
+
+architecture:
+  num_layers: 1
+  num_single_layers: 6
+  mapping_strategy: sensitivity
+  mapping_calibration_batches: 2
+  random_init: false
+
+distillation:
+  lambda_gt: 0.25
+  lambda_kd: 1.0
+  unconditional_probability: 0.10
+  weighting_scheme: logit_normal
+  logit_mean: 0.0
+  logit_std: 1.0
+
+optimization:
+  learning_rate: 2.0e-5
+  lr_scheduler: constant_with_warmup
+  lr_warmup_steps: 2000
+
+validation:
+  num_inference_steps: 50
+  guidance_scale: 4.0
+  height: 512
+  width: 512

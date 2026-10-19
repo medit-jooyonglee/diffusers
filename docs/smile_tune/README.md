@@ -56,11 +56,13 @@ python my/design_tune_server.py --port 5000 --device cuda:0
 | `--libraries-dir` | `outputs/design_tune_embedding_libraries` | 임베딩 라이브러리 저장 위치 |
 | `--steps` / `--guidance-scale` | `4` / `1.0` | 요청에서 `num_steps`, `guidance_scale`로 덮어쓸 수 있음 |
 | `--mask` / `--no-mask` | off | 얼굴 마스크 합성 기본값 (요청별로 덮어쓸 수 있음) |
+| `--mask-mode` | `inpaint` | 기본 `mask.mode` (`inpaint`/`composite`/`mice`, 5장 참고). 요청별로 덮어쓸 수 있음 |
 | `--mask-regions` | `mouth` | 쉼표 구분 영역 목록 (5장 참고) |
 | `--mask-dilate` | `8` | 마스크 확장 (픽셀) |
 | `--mask-feather` | `12.0` | 마스크 경계 blur 반경 (픽셀) |
 | `--face-landmarker-model` | `weights/face_landmarker.task` | MediaPipe 모델 경로 |
 | `--fp8-weights` / `--no-fp8-weights` | on | transformer 가중치를 fp8로 **저장**하고 레이어별로 bf16으로 올려 계산 (9장 참고) |
+| `--min-steps-non-distilled` | `20` | 비증류 모델(`is_distilled: false`)에서 step 수가 이보다 낮으면 경고 로그 + 응답 `step_warning` (klein-base-4B를 적은 step으로 쓰면 뭉개진 결과가 나오는 문제, [final_report.md 0.1절](final_report.md#01-distilled는-스텝-설정이-아니라-완전히-다른-가중치다)) |
 | `--build-device` | `--device`와 같음 | 임베딩 빌드용 GPU. 다르게 지정하면 빌드 중에도 추론 가능 (7.2장) |
 | `--build-timeout` | `7200` | 임베딩 빌드 제한 시간 (초) |
 
@@ -97,14 +99,17 @@ python my/design_tune_server.py --port 5000 --device cuda:0
 
 ## 5. 얼굴 마스크 옵션
 
-`parameters.mask.mode`로 두 방식을 고른다.
+`parameters.mask.mode`로 방식을 고른다. **서버 기본값은 `inpaint`다** (`--mask-mode`로 변경 가능,
+[final_report.md 0.5절](final_report.md#05-기본값을-composite에서-inpaint로-변경--mice-다중-영역-조합을-진짜-inpaint로-재구현)
+— composite는 좁은 영역의 정밀한 변화에 capacity를 충분히 못 써서 기본값에서 제외했다).
 
 | mode | 동작 |
 | --- | --- |
-| `composite` (기본) | 프롬프트 하나로 전체 이미지를 생성한 뒤, **선택한 영역만** 원본 환자 사진 위에 합성 (후처리) |
-| `mice` | 영역별 지시문을 attention bias로 각 영역에 묶어 한 번에 생성 (5.2장). `composite: true`면 생성 후 편집 영역만 원본에 합성 |
+| `inpaint` (기본, 권장, 5.3장) | `Flux2KleinInpaintPipeline`으로 마스크 영역만 **latent 단계에서 실제로** 재생성. `edits`를 주면 영역마다 순차적인 진짜 inpaint로 조합 (MICE 대체) |
+| `composite` (레거시) | 프롬프트 하나로 전체 이미지를 생성한 뒤, **선택한 영역만** 원본 환자 사진 위에 합성 (후처리) |
+| `mice` (레거시) | 영역별 지시문을 attention bias로 각 영역에 묶어 한 번에 생성 (5.2장). `composite: true`면 생성 후 편집 영역만 원본에 합성 |
 
-### 5.1 composite
+### 5.1 composite (레거시)
 
 마스크 밖은 원본 픽셀이 그대로 유지된다 (테스트에서 마스크 밖 픽셀 차이 0).
 
@@ -139,7 +144,11 @@ python my/design_tune_server.py --port 5000 --device cuda:0
 - `teeth`는 밝기 규칙이라 누렇거나 그늘진 치아는 놓칠 수 있다.
 - Face Landmarker는 CPU로 동작한다 (이미지당 약 10~30ms).
 
-### 5.2 MICE (영역별 지시문 동시 편집)
+### 5.2 MICE (영역별 지시문 동시 편집, 레거시)
+
+**여러 영역을 한 번에 조합하는 용도라면 5.3장의 `mask.mode: "inpaint"` + `edits`를 권장한다** — 결과가 더
+정확하고(영역 간 번짐 없음), `text_tokens`/`kernel_size`/`temperature` 같은 attention-bias 하이퍼파라미터
+튜닝이 필요 없다. MICE는 "여러 영역을 한 번의 forward로 묶어야" 하는 경우에만 쓴다.
 
 논문 "Editing Everything Everywhere All at Once"(MICE, arXiv 2606.31278)의 방식을 논문 설명을 바탕으로 직접 구현했다
 (공개 저장소는 라이선스가 없어 코드를 가져오지 않았다). diffusers 코어는 수정하지 않는다.
@@ -192,6 +201,57 @@ mice:
 
 비용 (A6000, fp8, 약 1MP): 시간 **+35~43%** (4.0초 → 1영역 5.3초, 3영역 5.7초), 최대 VRAM **+0.3GB** (6.7 → 7.0GB).
 빠른 flash 커널 대신 bias를 지원하는 커널을 쓰기 때문이다.
+
+### 5.3 inpaint (진짜 latent 단위 마스크 편집, 권장)
+
+`composite`는 전체 이미지를 새로 생성한 뒤 마스크 영역만 잘라 붙이는 방식이라, 모델이 좁은 영역의 정밀한
+변화(치아 모양 등)에 capacity를 충분히 못 쓴다. `inpaint`는 diffusers의 `Flux2KleinInpaintPipeline`으로
+**mask_image가 가리키는 영역만 latent 단계에서 실제로 재생성**한다 — 품질이 뚜렷이 낫고(특히 치아가 심하게
+망가진 극단적 케이스), 속도는 composite와 비슷하거나 더 빠르다 (실측: [final_report.md 0.2절](final_report.md#02-서버-통합-완료--5명-전체-재실험)).
+
+```json
+{
+  "style_name": "smile_final", "layout": "patient_tooth",
+  "mode": "preset", "preset": "align_whiten",
+  "mask": {"mode": "inpaint", "regions": ["mouth"], "dilate": 16, "feather": 12, "strength": 1.0}
+}
+```
+
+- `regions`/`dilate`/`feather`는 `composite`와 같은 의미로 mask_image를 만든다.
+- `strength`(기본 1.0): 1.0이면 마스크 안을 완전히 새로 생성, 낮추면 원본과 부분적으로 섞인다.
+- **layout에 두 번째 이미지가 있으면(예: `patient_tooth`) 자동으로 `image_reference`(치아 템플릿 등 "무엇으로
+  채울지"의 참조 이미지)로 전달된다** — 별도 파라미터가 필요 없다. `patient_only`(이미지 1장)로는 템플릿을
+  넣을 수 없다 (reference_roles가 이미지 수를 그대로 강제한다).
+- `prompt_embeds`는 `mode: preset/anchor/grid/delta`로 만든 **기존 캐시 임베딩을 그대로 쓴다** — 재빌드가
+  필요 없다. `edits`가 없을 때(위 예시)는 이 방식으로 regions 전체를 한 번에 inpaint한다.
+- 마스크 밖 픽셀은 생성이 끝난 뒤 한 번 더 원본과 합성해 픽셀 단위로 보존한다(resize 오차 방지).
+
+#### 여러 영역을 한 번에 조합 (`edits`, MICE 대체)
+
+MICE처럼 영역마다 다른 지시문(예: 치아 + 입술 + 눈)을 한 요청에서 조합하려면 `mask.edits`를 쓴다. YAML에
+`mice.regions` 섹션이 있어야 하고(5.2장과 같은 스키마), 영역 지시문 캐시 임베딩이 빌드돼 있어야 한다.
+
+```json
+{
+  "style_name": "pose-makeup-v2",
+  "layout": "patient_only",
+  "seed": 0,
+  "mask": {
+    "mode": "inpaint",
+    "feather": 6, "dilate": 4,
+    "edits": [{"prompt": "teeth_white"}, {"prompt": "lips_red"}, {"prompt": "eyes_liner"}]
+  }
+}
+```
+
+- MICE의 attention bias 대신, **영역마다 순차적으로 진짜 inpaint 호출을 체이닝**한다(`InferenceEngine._inpaint_sequential`):
+  각 호출은 그 영역의 캐시 임베딩만 쓰고, 이전 호출의 출력 위에 다음 영역을 이어서 inpaint한다. 끝나면 전체
+  영역 합집합 마스크로 원본과 한 번 더 합성한다.
+- 영역이 완전히 독립적인 호출이라 MICE처럼 `text_tokens`/`kernel_size`/`temperature`를 맞출 필요가 없고,
+  영역 간 번짐도 구조적으로 생기지 않는다.
+- 속도는 영역 수에 비례한다(영역당 약 1회 inpaint 호출 분, [final_report.md 0.5절](final_report.md#05-기본값을-composite에서-inpaint로-변경--mice-다중-영역-조합을-진짜-inpaint로-재구현)
+  실측: 3영역 체이닝 13.7초, 영역당 약 4.6초).
+- 응답 메타데이터: `mix.mode: "inpaint_sequential"`, `mask.sequential_edits`에 영역별 마스크 픽셀 수 등이 기록된다.
 
 ## 6. 클라이언트 (`my/design_tune_client.py`)
 

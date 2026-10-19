@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import logging
 import math
 import os
 import re
@@ -22,7 +23,7 @@ import yaml
 from flask import Flask, Response, jsonify, request, send_file
 from PIL import Image, ImageFilter, ImageOps, PngImagePlugin
 
-from diffusers import Flux2KleinPipeline
+from diffusers import Flux2KleinInpaintPipeline, Flux2KleinPipeline
 
 from smile_design.embedding_library import EmbeddingLibrary
 from smile_design.face_mask import MASK_REGIONS, FaceMasker, parse_regions
@@ -32,12 +33,13 @@ from smile_design.prompt_templates import build_prompt_entries, load_experiment_
 
 
 ROOT = Path(__file__).resolve().parents[1]
+app_logger = logging.getLogger("design_tune")
 DEFAULT_MODEL = (
-    "/root/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-4B/"
+    "/data1/jooyonglee/pretrained/flux2/models--black-forest-labs--FLUX.2-klein-4B/"
     "snapshots/e7b7dc27f91deacad38e78976d1f2b499d76a294"
 )
 DEFAULT_TEXT_ENCODER_MODEL = (
-    "/root/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-base-4B/"
+    "/data1/jooyonglee/pretrained/flux2/models--black-forest-labs--FLUX.2-klein-base-4B/"
     "snapshots/a3b4f4849157f664bdbc776fd7453c2783562f4d"
 )
 STYLE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -73,11 +75,19 @@ def torch_dtype(name: str) -> torch.dtype:
 
 def resolve_mask_options(value: Any, args: argparse.Namespace) -> dict[str, Any]:
     # 요청의 parameters.mask: 생략하면 서버 기본값, true/false, 또는 옵션 객체
-    # mode "composite": 전체 생성 후 regions 영역만 원본에 합성
-    # mode "mice": edits(영역별 지시문)를 attention bias로 영역에 묶어 한 번에 생성 (smile_design/mice.py)
+    # mode "inpaint" (기본): Flux2KleinInpaintPipeline으로 regions 영역만 latent 단계에서 실제로 재생성
+    #   (docs/smile_tune/final_report.md 0장 — composite보다 훨씬 자연스럽고, 극단적 케이스도 복원됨).
+    #   edits가 있으면 영역마다 순차적으로 진짜 inpaint를 적용한다 (MICE의 "여러 영역 동시 조합"을
+    #   attention bias 대신 latent mask로 구현한 것 — 0.4절). 없으면 preset/anchor/grid/delta로 만든
+    #   프롬프트 하나로 regions 전체를 한 번에 inpaint한다. layout에 두 번째 이미지(tooth 등)가
+    #   있으면 자동으로 image_reference로 사용한다.
+    # mode "mice": edits(영역별 지시문)를 attention bias로 영역에 묶어 한 번에 생성 (smile_design/mice.py).
+    #   레거시 — inpaint의 edits 방식이 더 정확하고 단순하다 (0.4절). 여러 영역을 "한 번의 forward"로
+    #   묶어야만 하는 경우에만 쓴다.
+    # mode "composite": 전체 생성 후 regions 영역만 원본에 RGB로 합성 (레거시, inpaint보다 품질이 낮음)
     options = {
         "enabled": args.mask,
-        "mode": "composite",
+        "mode": args.mask_mode,
         "regions": parse_regions(args.mask_regions),
         "dilate": args.mask_dilate,
         "feather": args.mask_feather,
@@ -88,6 +98,7 @@ def resolve_mask_options(value: Any, args: argparse.Namespace) -> dict[str, Any]
         "mice_steps": None,
         "composite": False,
         "text_tokens": 200,
+        "strength": 1.0,
     }
     if value is None:
         return options
@@ -109,14 +120,21 @@ def resolve_mask_options(value: Any, args: argparse.Namespace) -> dict[str, Any]
     if "feather" in value:
         options["feather"] = float(value["feather"])
     if "mode" in value:
-        if value["mode"] not in ("composite", "mice"):
-            raise ValueError("mask.mode must be 'composite' or 'mice'")
+        if value["mode"] not in ("composite", "mice", "inpaint"):
+            raise ValueError("mask.mode must be 'composite', 'mice', or 'inpaint'")
         options["mode"] = value["mode"]
-    if options["mode"] == "mice":
-        edits = value.get("edits")
+    if options["mode"] == "inpaint" and "strength" in value:
+        options["strength"] = float(value["strength"])
+    if not 0.0 < options["strength"] <= 1.0:
+        raise ValueError("mask.strength must be in (0, 1]")
+    if options["mode"] in ("mice", "inpaint") and "edits" in value:
+        edits = value["edits"]
         if not isinstance(edits, list) or not edits or not all(isinstance(e, dict) and "prompt" in e for e in edits):
             raise ValueError('mask.edits must be a non-empty list of {"prompt": name, "region": optional}')
         options["edits"] = edits
+    if options["mode"] == "mice" and not options["edits"]:
+        raise ValueError('mask.mode "mice" requires a non-empty mask.edits')
+    if options["mode"] == "mice":
         options["global"] = str(value.get("global", options["global"]))
         options["kernel_size"] = int(value.get("kernel_size", options["kernel_size"]))
         options["temperature"] = float(value.get("temperature", options["temperature"]))
@@ -435,6 +453,7 @@ class InferenceEngine:
         self.args = args
         self.dtype = torch_dtype(args.dtype)
         self.pipeline: Flux2KleinPipeline | None = None
+        self.inpaint_pipeline: Flux2KleinInpaintPipeline | None = None
         self.lock = threading.RLock()
         self.masker = FaceMasker(args.face_landmarker_model)
         self.prompt_length: PromptLengthCounter | None = None
@@ -453,10 +472,15 @@ class InferenceEngine:
                 self.dtype,
                 self.args.local_files_only,
             )
+            # load_transformer_override는 root에 단일 safetensors 파일뿐인 체크포인트(klein-4B)에서만
+            # override를 반환한다. 이미 diffusers 폴더 형식(예: klein-base-4B)이면 None을 반환하는데,
+            # from_pretrained에 transformer=None을 그대로 넘기면 "이 컴포넌트는 없다"로 해석되어
+            # transformer가 아예 로드되지 않는다 — kwarg 자체를 생략해 정상적으로 로드되게 한다.
+            transformer_kwargs = {"transformer": transformer} if transformer is not None else {}
             pipeline = Flux2KleinPipeline.from_pretrained(
                 self.args.model,
                 revision=self.args.revision,
-                transformer=transformer,
+                **transformer_kwargs,
                 text_encoder=None,
                 tokenizer=None,
                 dtype=self.dtype,
@@ -480,6 +504,25 @@ class InferenceEngine:
             self.pipeline = pipeline
             return pipeline
 
+    def load_inpaint(self) -> Flux2KleinInpaintPipeline:
+        # 메인 파이프라인과 transformer/vae 모듈 인스턴스를 그대로 공유한다 (fp8 캐스팅 포함, VRAM 추가 없음)
+        with self.lock:
+            if self.inpaint_pipeline is not None:
+                return self.inpaint_pipeline
+            pipeline = self.load()
+            inpaint = Flux2KleinInpaintPipeline(
+                scheduler=pipeline.scheduler,
+                vae=pipeline.vae,
+                text_encoder=None,
+                tokenizer=None,
+                transformer=pipeline.transformer,
+                is_distilled=pipeline.config.get("is_distilled", False),
+            )
+            inpaint.to(self.args.device) if not self.args.cpu_offload else None
+            inpaint.set_progress_bar_config(dynamic_ncols=True)
+            self.inpaint_pipeline = inpaint
+            return inpaint
+
     def infer(
         self,
         library: EmbeddingLibrary,
@@ -494,6 +537,10 @@ class InferenceEngine:
         if len(images) != len(roles):
             raise ValueError(f"Layout {layout!r} requires {len(roles)} images in order {roles}, got {len(images)}")
         mask_options = resolve_mask_options(parameters.get("mask"), self.args)
+        is_inpaint = mask_options["enabled"] and mask_options["mode"] == "inpaint"
+        if is_inpaint and mask_options["edits"]:
+            # 여러 영역을 한 요청에서 조합: attention bias(mice) 대신 영역마다 순차적인 진짜 inpaint로 처리한다
+            return self._inpaint_sequential(library, config, layout, images, parameters, mask_options)
         mask_image, mask_metadata, mice = None, {"enabled": False}, None
         if mask_options["enabled"] and mask_options["mode"] == "mice":
             mice, mask_image, mask_metadata = self._mice(library, config, layout, images[0], mask_options)
@@ -504,12 +551,15 @@ class InferenceEngine:
                 mask_image, mask_metadata = self.masker.build(
                     images[0], mask_options["regions"], mask_options["dilate"], mask_options["feather"]
                 )
+                if is_inpaint:
+                    mask_metadata["mode"] = "inpaint"
+                    mask_metadata["strength"] = mask_options["strength"]
             prompt_embeds, mix = self._embedding(library, layout, parameters)
         original_size = images[0].size
         width, height = internal_size(
             original_size[0], original_size[1], self.args.dimension_multiple, self.args.max_generation_area
         )
-        pipeline = self.load()
+        pipeline = self.load_inpaint() if is_inpaint else self.load()
         steps = int(parameters.get("num_steps", parameters.get("steps", self.args.steps)))
         guidance_scale = float(parameters.get("guidance_scale", self.args.guidance_scale))
         # step-distilled 모델은 CFG를 쓰지 않으므로 negative 임베딩을 GPU에 올리지 않음
@@ -519,18 +569,46 @@ class InferenceEngine:
         seed = int(parameters.get("seed", 0))
         if steps < 1:
             raise ValueError("steps must be at least 1")
+        step_warning = None
+        if not pipeline.config.get("is_distilled", False) and steps < self.args.min_steps_non_distilled:
+            # klein-4B(distilled)는 4 step용으로 따로 학습된 가중치라 적은 step에서도 수렴하지만,
+            # klein-base-4B 같은 비증류 모델은 같은 step 수로는 뭉개진 결과만 나온다 (실측 확인, final_report.md 0장)
+            step_warning = (
+                f"Model is not step-distilled but num_inference_steps={steps} "
+                f"(< {self.args.min_steps_non_distilled}); expect blurry/incoherent output. "
+                "Use the distilled klein-4B checkpoint for low step counts, or raise steps for this model."
+            )
+            app_logger.warning(f"[design_tune] {step_warning}")
         generator = torch.Generator(device=self.args.device).manual_seed(seed)
-        call_kwargs = {
-            "image": images,
-            "prompt_embeds": prompt_embeds,
-            "negative_prompt_embeds": negative_prompt_embeds,
-            "num_inference_steps": steps,
-            "guidance_scale": guidance_scale,
-            "height": height,
-            "width": width,
-            "num_images_per_prompt": 1,
-            "generator": generator,
-        }
+        if is_inpaint:
+            # Flux2KleinInpaintPipeline: mask_image가 latent 단계에서 영역을 제한한다 (RGB 후처리 합성보다 정확함).
+            # layout에 두 번째 이미지가 있으면(예: patient_tooth) 치아 모양 참조로 그대로 넘긴다
+            call_kwargs = {
+                "image": images[0],
+                "mask_image": mask_image,
+                "image_reference": images[1] if len(images) > 1 else None,
+                "strength": mask_options["strength"],
+                "prompt_embeds": prompt_embeds,
+                "negative_prompt_embeds": negative_prompt_embeds,
+                "num_inference_steps": steps,
+                "guidance_scale": guidance_scale,
+                "height": height,
+                "width": width,
+                "num_images_per_prompt": 1,
+                "generator": generator,
+            }
+        else:
+            call_kwargs = {
+                "image": images,
+                "prompt_embeds": prompt_embeds,
+                "negative_prompt_embeds": negative_prompt_embeds,
+                "num_inference_steps": steps,
+                "guidance_scale": guidance_scale,
+                "height": height,
+                "width": width,
+                "num_images_per_prompt": 1,
+                "generator": generator,
+            }
         with self.lock, torch.inference_mode():
             hook = mice.install(pipeline.transformer) if mice else None
             try:
@@ -541,7 +619,7 @@ class InferenceEngine:
         if generated.size != original_size:
             generated = generated.resize(original_size, Image.Resampling.LANCZOS)
         if mask_image is not None:
-            # 마스크 밖은 원본 환자 픽셀을 그대로 유지
+            # 마스크 밖은 원본 환자 픽셀을 그대로 유지 (inpaint도 resize 과정의 오차를 없애기 위해 한 번 더 적용)
             generated = Image.composite(generated.convert("RGB"), images[0], mask_image)
         metadata = {
             "style_name": parameters["style_name"],
@@ -556,6 +634,101 @@ class InferenceEngine:
             "output_size": list(generated.size),
             "text_encoder_loaded": False,
             "mask": mask_metadata,
+            "step_warning": step_warning,
+        }
+        return generated, metadata
+
+    def _inpaint_sequential(
+        self,
+        library: EmbeddingLibrary,
+        config: dict[str, Any],
+        layout: str,
+        images: list[Image.Image],
+        parameters: dict[str, Any],
+        mask_options: dict[str, Any],
+    ) -> tuple[Image.Image, dict[str, Any]]:
+        # mode "inpaint" + edits: MICE의 "여러 영역을 한 번에 조합" 역할을 attention bias 대신 영역마다
+        # 순차적인 진짜 inpaint 호출로 구현한다 (final_report.md 0.4절). 각 호출은 자기 영역의 텍스트
+        # 임베딩만 쓰고 (MICE처럼 전역 지시문과 합치지 않음 — 바깥 픽셀은 latent mask가 이미 보존한다),
+        # 이전 호출의 출력 위에 이어서 다음 영역을 inpaint한다. 끝나면 전체 영역 합집합으로 원본과
+        # 한 번 더 합성해 바깥 픽셀을 보존한다 (resize 오차 방지).
+        regions_config = config.get("mice", {}).get("regions", {})
+        if not regions_config:
+            raise ValueError("This style has no mice section; add mice.global / mice.regions and rebuild")
+        roles = reference_roles(config, layout)
+        patient = images[0]
+        reference = images[1] if len(images) > 1 else None
+        original_size = patient.size
+        width, height = internal_size(
+            original_size[0], original_size[1], self.args.dimension_multiple, self.args.max_generation_area
+        )
+        pipeline = self.load_inpaint()
+        steps = int(parameters.get("num_steps", parameters.get("steps", self.args.steps)))
+        guidance_scale = float(parameters.get("guidance_scale", self.args.guidance_scale))
+        negative_prompt_embeds = None
+        if guidance_scale > 1.0 and not pipeline.config.get("is_distilled", False):
+            negative_prompt_embeds = library.load_negative(self.args.device, self.dtype)
+        seed = int(parameters.get("seed", 0))
+        if steps < 1:
+            raise ValueError("steps must be at least 1")
+        step_warning = None
+        if not pipeline.config.get("is_distilled", False) and steps < self.args.min_steps_non_distilled:
+            step_warning = (
+                f"Model is not step-distilled but num_inference_steps={steps} "
+                f"(< {self.args.min_steps_non_distilled}); expect blurry/incoherent output."
+            )
+            app_logger.warning(f"[design_tune] {step_warning}")
+        masks, _ = self.masker.region_masks(patient)
+        current, union, edit_metadata = patient, None, []
+        with self.lock, torch.inference_mode():
+            for index, edit in enumerate(mask_options["edits"]):
+                name = str(edit["prompt"])
+                if name not in regions_config:
+                    raise ValueError(f"Unknown mice region prompt {name!r}; choose from {sorted(regions_config)}")
+                regions = parse_regions(edit.get("region", regions_config[name]["region"]))
+                mask = self.masker.union(masks, regions, int(edit.get("dilate", mask_options["dilate"])))
+                mask_image = Image.fromarray(mask, mode="L").filter(ImageFilter.GaussianBlur(mask_options["feather"]))
+                embeds = library.load(f"{layout}/mice/region/{name}", self.args.device, self.dtype)
+                generator = torch.Generator(device=self.args.device).manual_seed(seed + index)
+                current = pipeline(
+                    image=current,
+                    mask_image=mask_image,
+                    image_reference=reference,
+                    strength=mask_options["strength"],
+                    prompt_embeds=embeds,
+                    negative_prompt_embeds=negative_prompt_embeds,
+                    num_inference_steps=steps,
+                    guidance_scale=guidance_scale,
+                    height=height,
+                    width=width,
+                    num_images_per_prompt=1,
+                    generator=generator,
+                ).images[0]
+                if current.size != original_size:
+                    current = current.resize(original_size, Image.Resampling.LANCZOS)
+                union = mask if union is None else union | mask
+                edit_metadata.append({"prompt": name, "regions": regions, "mask_pixels": int((mask > 0).sum())})
+        union_mask = Image.fromarray(union, mode="L").filter(ImageFilter.GaussianBlur(mask_options["feather"]))
+        generated = Image.composite(current.convert("RGB"), patient, union_mask)
+        metadata = {
+            "style_name": parameters["style_name"],
+            "layout": layout,
+            "roles": roles,
+            "mix": {"mode": "inpaint_sequential", "edits": [e["prompt"] for e in edit_metadata]},
+            "seed": seed,
+            "steps": steps,
+            "guidance_scale": guidance_scale,
+            "input_size": list(original_size),
+            "internal_size": [width, height],
+            "output_size": list(generated.size),
+            "text_encoder_loaded": False,
+            "mask": {
+                "enabled": True,
+                "mode": "inpaint",
+                "strength": mask_options["strength"],
+                "sequential_edits": edit_metadata,
+            },
+            "step_warning": step_warning,
         }
         return generated, metadata
 
@@ -730,8 +903,10 @@ def create_app(args: argparse.Namespace | None = None) -> Flask:
                 "dtype": args.dtype,
                 "running_build_jobs": running,
                 "fp8_weights": args.fp8_weights,
+                "min_steps_non_distilled": args.min_steps_non_distilled,
                 "mask": {
                     "enabled": args.mask,
+                    "mode": args.mask_mode,
                     "regions": parse_regions(args.mask_regions),
                     "dilate": args.mask_dilate,
                     "feather": args.mask_feather,
@@ -899,6 +1074,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--dtype", choices=("bf16", "fp16", "fp32"), default="bf16")
     parser.add_argument("--steps", type=parse_positive_int, default=4)
+    parser.add_argument(
+        "--min-steps-non-distilled",
+        type=parse_positive_int,
+        default=20,
+        help=(
+            "Below this num_inference_steps, warn when the loaded model is not step-distilled "
+            "(e.g. klein-base-4B at 4 steps produces blurry/incoherent output; use klein-4B for low steps)"
+        ),
+    )
     parser.add_argument("--guidance-scale", type=float, default=1.0)
     parser.add_argument("--dimension-multiple", type=parse_positive_int, default=16)
     parser.add_argument("--max-generation-area", type=parse_non_negative_int, default=1024 * 1024)
@@ -918,7 +1102,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--mask",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Composite only the masked face regions onto the patient image (per-request parameters.mask overrides)",
+        help="Restrict edits to the masked face regions (per-request parameters.mask overrides)",
+    )
+    parser.add_argument(
+        "--mask-mode",
+        choices=("inpaint", "composite", "mice"),
+        default="inpaint",
+        help="Default mask.mode: true latent-level inpaint (recommended, see final_report.md), "
+        "legacy full-regenerate-then-RGB-composite, or the attention-bias MICE path",
     )
     parser.add_argument("--mask-regions", default="mouth", help=f"Comma-separated, from {', '.join(MASK_REGIONS)}")
     parser.add_argument("--mask-dilate", type=parse_non_negative_int, default=8, help="Mask dilation in pixels")

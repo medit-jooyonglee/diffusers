@@ -186,3 +186,11 @@ wandb
 # AI agent generated symlinks
 /.agents/skills
 /.claude/skills
+*.png
+*.jps
+*.txt
+*.json
+*.pkl
+*.pt
+*.bin
+*.safetensors
