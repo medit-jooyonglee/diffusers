@@ -21,6 +21,7 @@ from typing import Any
 import torch
 import yaml
 from flask import Flask, Response, jsonify, request, send_file
+from werkzeug.exceptions import HTTPException
 from PIL import Image, ImageFilter, ImageOps, PngImagePlugin
 
 from diffusers import Flux2KleinInpaintPipeline, Flux2KleinPipeline
@@ -43,6 +44,23 @@ DEFAULT_TEXT_ENCODER_MODEL = (
     "snapshots/a3b4f4849157f664bdbc776fd7453c2783562f4d"
 )
 STYLE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+SWAGGER_UI_VERSION = "5.17.14"
+SWAGGER_UI_HTML = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Smile Design Tune API</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@{SWAGGER_UI_VERSION}/swagger-ui.css">
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@{SWAGGER_UI_VERSION}/swagger-ui-bundle.js"></script>
+  <script>
+    SwaggerUIBundle({{url: "openapi.json", dom_id: "#swagger-ui", deepLinking: true, showExtensions: true}});
+  </script>
+</body>
+</html>
+"""
 
 
 def utc_now() -> str:
@@ -488,7 +506,12 @@ class InferenceEngine:
             )
             if pipeline.text_encoder is not None or pipeline.tokenizer is not None:
                 raise RuntimeError("Inference pipeline unexpectedly loaded a text encoder or tokenizer")
-            if self.args.fp8_weights:
+            if self.args.fp8_compute:
+                # 가중치와 활성화를 모두 fp8로 양자화해 fp8 텐서코어(_scaled_mm)로 계산 (Ada/Hopper 이상 필요)
+                from torchao.quantization import Float8DynamicActivationFloat8WeightConfig, PerRow, quantize_
+
+                quantize_(pipeline.transformer, Float8DynamicActivationFloat8WeightConfig(granularity=PerRow()))
+            elif self.args.fp8_weights:
                 # transformer 가중치를 fp8로 보관하고 레이어 계산 시에만 bf16으로 올림 (VRAM 약 3.8GB 절약)
                 pipeline.transformer.enable_layerwise_casting(
                     storage_dtype=torch.float8_e4m3fn, compute_dtype=self.dtype
@@ -500,6 +523,12 @@ class InferenceEngine:
                 pipeline.enable_model_cpu_offload(gpu_id=gpu_id)
             else:
                 pipeline.to(self.args.device)
+            if self.args.compile == "regional":
+                # 반복되는 transformer 블록만 컴파일해 모든 블록에 재사용 (전체 compile보다 컴파일 시간이 짧다)
+                pipeline.transformer.compile_repeated_blocks(dynamic=True)
+            elif self.args.compile == "full":
+                # fp8 연산은 양자화/스케일 커널이 matmul과 fuse되어야 bf16보다 빨라진다 (eager에서는 이득 거의 없음)
+                pipeline.transformer.compile(dynamic=True)
             pipeline.set_progress_bar_config(dynamic_ncols=True)
             self.pipeline = pipeline
             return pipeline
@@ -518,7 +547,8 @@ class InferenceEngine:
                 transformer=pipeline.transformer,
                 is_distilled=pipeline.config.get("is_distilled", False),
             )
-            inpaint.to(self.args.device) if not self.args.cpu_offload else None
+            # 공유한 모듈은 load()에서 이미 device에 올라가 있어 .to()를 다시 부르지 않는다. compile된 fp8 transformer에
+            # .to()를 걸면 torchao fp8 가중치 swap이 dynamo weakref 때문에 실패해 이후 inpaint 요청이 전부 500이 된다
             inpaint.set_progress_bar_config(dynamic_ncols=True)
             self.inpaint_pipeline = inpaint
             return inpaint
@@ -903,6 +933,8 @@ def create_app(args: argparse.Namespace | None = None) -> Flask:
                 "dtype": args.dtype,
                 "running_build_jobs": running,
                 "fp8_weights": args.fp8_weights,
+                "fp8_compute": args.fp8_compute,
+                "compile": args.compile,
                 "min_steps_non_distilled": args.min_steps_non_distilled,
                 "mask": {
                     "enabled": args.mask,
@@ -914,6 +946,21 @@ def create_app(args: argparse.Namespace | None = None) -> Flask:
                 },
             }
         )
+
+    openapi_path = Path(__file__).with_name("openapi.yaml")
+
+    @app.get("/openapi.yaml")
+    def openapi_yaml():
+        return send_file(openapi_path, mimetype="application/yaml")
+
+    @app.get("/openapi.json")
+    def openapi_json():
+        return jsonify(yaml.safe_load(openapi_path.read_text(encoding="utf-8")))
+
+    @app.get("/docs")
+    def swagger_ui():
+        # Swagger UI 정적 파일은 CDN에서 받는다 (브라우저가 인터넷에 접근할 수 있어야 함)
+        return Response(SWAGGER_UI_HTML, content_type="text/html; charset=utf-8")
 
     @app.post("/api/v1/mask")
     def preview_mask():
@@ -1045,6 +1092,9 @@ def create_app(args: argparse.Namespace | None = None) -> Flask:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             return json_error(f"CUDA out of memory: {error}", 507)
+        except HTTPException:
+            # 요청 크기 초과(413) 등은 아래 errorhandler가 원래 상태 코드로 응답하도록 그대로 올린다
+            raise
         except Exception as error:
             app.logger.exception("Design Tune inference failed")
             return json_error(f"Inference failed: {error}", 500)
@@ -1099,6 +1149,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Store transformer weights in fp8 and upcast per layer (about 3.8GB less VRAM, about 3%% slower)",
     )
     parser.add_argument(
+        "--fp8-compute",
+        action="store_true",
+        help="Quantize transformer weights and activations to fp8 and run matmuls on fp8 tensor cores "
+        "(torchao, needs compute capability 8.9+; takes precedence over --fp8-weights)",
+    )
+    parser.add_argument(
+        "--compile",
+        nargs="?",
+        const="full",
+        choices=("full", "regional"),
+        help="torch.compile the transformer: 'full' (default when given without a value) or 'regional' "
+        "(repeated blocks only, shorter compile). The first request compiles; needed for --fp8-compute speedup",
+    )
+    parser.add_argument(
         "--mask",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1111,9 +1175,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Default mask.mode: true latent-level inpaint (recommended, see final_report.md), "
         "legacy full-regenerate-then-RGB-composite, or the attention-bias MICE path",
     )
-    parser.add_argument("--mask-regions", default="mouth", help=f"Comma-separated, from {', '.join(MASK_REGIONS)}")
-    parser.add_argument("--mask-dilate", type=parse_non_negative_int, default=8, help="Mask dilation in pixels")
-    parser.add_argument("--mask-feather", type=float, default=12.0, help="Mask edge blur radius in pixels")
+    parser.add_argument("--mask-regions", default="inner_mouth", help=f"Comma-separated, from {', '.join(MASK_REGIONS)}")
+    parser.add_argument("--mask-dilate", type=parse_non_negative_int, default=4, help="Mask dilation in pixels")
+    parser.add_argument("--mask-feather", type=float, default=6.0, help="Mask edge blur radius in pixels")
     parser.add_argument("--face-landmarker-model", type=Path, default=ROOT / "weights" / "face_landmarker.task")
     parser.add_argument("--local-files-only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--debug", action="store_true")

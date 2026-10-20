@@ -19,7 +19,7 @@
 # 문구만으로 미백/정렬 (템플릿 없이, patient_only로 가능):
 #   {"mask": {"mode": "mice", "composite": true, "edits": [{"prompt": "teeth_align_white"}]}}
 # 기존 preset/anchor/grid 방식 (임베딩 보간, 템플릿 없이 색/배열만):
-#   {"mode": "preset", "preset": "align_whiten", "mask": {"regions": ["mouth"], "dilate": 16, "feather": 12}}
+#   {"mode": "preset", "preset": "align_whiten", "mask": {"regions": ["inner_mouth"], "dilate": 4, "feather": 6}}
 version: 1
 template_version: smile-final-v1
 base_template: |-

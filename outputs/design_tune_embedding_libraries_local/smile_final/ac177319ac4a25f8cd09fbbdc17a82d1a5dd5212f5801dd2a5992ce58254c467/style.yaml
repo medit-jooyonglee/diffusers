@@ -1,0 +1,115 @@
+# 최종 배포 후보 스타일. smile_teeth.yaml(색/배열 분리)에 MICE 치아 템플릿 교체 기능과
+# head_yaw/head_pitch(고개 방향, pose-makeup-v2.yaml과 동일한 축) 추가했다.
+# 미백/정렬은 기존처럼 preset으로 선택하는 옵션이다 (natural이 기본, 변화 없음).
+# 미용(메이크업)은 포함하지 않는다 (별도 smile_makeup.yaml 또는 pose-makeup-v2.yaml 참고).
+# docs/smile_tune/final_report.md 결과 기반.
+#
+# 주의: pose는 preset/anchor/grid/delta 모드에서만 적용된다. MICE(mask.mode: mice)는 mice.global이
+# "keep ... head pose ..."로 고정돼 있어 pose가 적용되지 않는다 (pose-makeup-v2.yaml과 동일한 제약).
+#
+# layout: patient_only(환자 사진 1장) / patient_tooth(환자 + 치아 템플릿 참조 2장).
+# patient_tooth는 MICE의 teeth_from_template 영역 편집에만 필요하다 (템플릿 이미지를 쓰려면
+# 반드시 patient_tooth로 2장을 보내야 한다 — layout이 요구하는 이미지 수와 보낸 이미지 수가
+# 정확히 같아야 하기 때문. images=[patient] 1장으로는 템플릿 이미지를 넣을 자리가 없다).
+#
+# MICE 사용 예 (템플릿으로 치아 모양 교체, composite로 배경/표정 보존):
+#   {"style_name": "smile_final", "layout": "patient_tooth", "seed": 0,
+#    "mask": {"mode": "mice", "composite": true, "feather": 6, "dilate": 4,
+#             "edits": [{"prompt": "teeth_from_template"}]}}
+# 문구만으로 미백/정렬 (템플릿 없이, patient_only로 가능):
+#   {"mask": {"mode": "mice", "composite": true, "edits": [{"prompt": "teeth_align_white"}]}}
+# 기존 preset/anchor/grid 방식 (임베딩 보간, 템플릿 없이 색/배열만):
+#   {"mode": "preset", "preset": "align_whiten", "mask": {"regions": ["inner_mouth"], "dilate": 4, "feather": 6}}
+version: 1
+template_version: smile-final-v1
+base_template: |-
+  Edit image 1, a photo of this person. {reference_instructions}
+  Keep exactly the same person: face shape, facial proportions, eye shape, nose, skin tone, age, hairstyle, and accessories.
+  Keep the facial expression, mouth opening, lips, lighting, clothing, and background exactly as in image 1.
+  Head yaw: {head_yaw}
+  Head pitch: {head_pitch}
+  Tooth alignment: {alignment}
+  Tooth color: {tooth_color}
+  Do not add, remove, enlarge, or reshape any tooth beyond the requested change. Keep the result anatomically plausible and photorealistic.
+layouts:
+  patient_only:
+    roles: [patient]
+    instruction: Apply only the changes listed below.
+  patient_tooth:
+    roles: [patient, tooth]
+    instruction: Apply only the changes listed below. Use image 2 only as a reference for tooth shape, proportions, and arrangement.
+controls:
+  head_yaw:
+    default: 50
+    anchors:
+      "0": turn the head clearly to the side so the face points toward the left edge of the image, a three-quarter view
+      "25": turn the head slightly so the face points a little toward the left edge of the image
+      "50": keep the head orientation exactly as in image 1
+      "75": turn the head slightly so the face points a little toward the right edge of the image
+      "100": turn the head clearly to the side so the face points toward the right edge of the image, a three-quarter view
+  head_pitch:
+    default: 50
+    anchors:
+      "0": tilt the head far down, chin pressed toward the chest, the camera sees the top of the head and the eyes look down
+      "25": tilt the head moderately down with the chin lowered
+      "50": keep the head tilt exactly as in image 1
+      "75": tilt the head moderately up with the chin raised
+      "100": tilt the head far back and up, chin raised high, the camera sees under the chin and the eyes look up
+  tooth_color:
+    default: 0
+    anchors:
+      "0": keep the exact original tooth color
+      "25": change only the color to a slightly brighter natural shade
+      "50": change only the color to a natural white shade
+      "75": change only the color to a bright white shade
+      "100": change only the color to a very bright cosmetic white shade
+  alignment:
+    default: 0
+    anchors:
+      "0": keep every tooth's shape, size, position, gaps, and arrangement exactly as in image 1
+      "25": move only the single most crooked or protruding tooth slightly back toward the dental arch
+      "50": move only the crooked, overlapping, or protruding teeth, such as a snaggletooth, back into line with the neighboring teeth
+      "75": straighten all crooked, overlapping, and protruding teeth into an even dental arch, like after orthodontic treatment
+      "100": straighten all crooked, overlapping, and protruding teeth into a neat, even, symmetric dental arch, like after complete orthodontic treatment
+presets:
+  natural: {}
+  whitening_natural:
+    tooth_color: 50
+  whitening_only:
+    tooth_color: 100
+  align_snaggle:
+    alignment: 50
+  align_only:
+    alignment: 100
+  align_whiten:
+    alignment: 100
+    tooth_color: 75
+  turn_left:
+    head_yaw: 0
+  turn_right:
+    head_yaw: 100
+  look_up:
+    head_pitch: 100
+  look_down:
+    head_pitch: 0
+grids:
+  align_color:
+    attributes: [alignment, tooth_color]
+  yaw_pitch:
+    attributes: [head_yaw, head_pitch]
+mice:
+  global:
+    default: Edit image 1, a photo of this person. {reference_instructions} Keep exactly the same person, face, head pose, facial expression, mouth opening, lighting, clothing, and background. Change only what the separate region instructions describe.
+  regions:
+    teeth_white:
+      region: [teeth, inner_mouth]
+      prompt: Make these teeth a clean natural bright white color. Keep each tooth's shape, size, position, gaps, and arrangement exactly the same.
+    teeth_align:
+      region: [mouth]
+      prompt: Straighten the crooked, overlapping, or protruding teeth, such as a snaggletooth, into an even dental arch like after orthodontic treatment. Keep the tooth color, the lips, and the mouth opening the same.
+    teeth_align_white:
+      region: [mouth]
+      prompt: Straighten the crooked, overlapping, or protruding teeth into an even dental arch like after orthodontic treatment, and make the teeth a natural bright white. Keep the lips and the mouth opening the same.
+    teeth_from_template:
+      region: [mouth]
+      prompt: Replace the shape, proportions, size, and arrangement of these teeth with the teeth shown in image 2, keeping a natural bright white color. Keep this person's lips, gums, and mouth opening exactly the same as in image 1. Ignore the background of image 2.

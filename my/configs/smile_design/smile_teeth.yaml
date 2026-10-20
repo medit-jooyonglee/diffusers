@@ -1,8 +1,8 @@
 # 치아 전용 기본 스타일 (미백 / 교정). docs/smile_tune/experiments.md 10장 결과 기반.
 # 권장 요청:
 #   미백만:      {"mode": "preset", "preset": "whitening_only", "mask": {"regions": ["teeth", "inner_mouth"], "dilate": 3, "feather": 4}}
-#   교정:        {"mode": "preset", "preset": "align_only",     "mask": {"regions": ["mouth"], "dilate": 16, "feather": 12}}
-#   교정 + 미백: {"mode": "preset", "preset": "align_whiten",   "mask": {"regions": ["mouth"], "dilate": 16, "feather": 12}}
+#   교정:        {"mode": "preset", "preset": "align_only",     "mask": {"regions": ["inner_mouth"], "dilate": 4, "feather": 6}}
+#   교정 + 미백: {"mode": "preset", "preset": "align_whiten",   "mask": {"regions": ["inner_mouth"], "dilate": 4, "feather": 6}}
 # 주의: tooth_color를 delta 강도 x3 이상으로 쓰면 입술이 푸르게 변하는 아티팩트가 생긴다.
 version: 1
 template_version: smile-teeth-v1

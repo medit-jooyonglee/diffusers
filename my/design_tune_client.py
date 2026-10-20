@@ -207,7 +207,7 @@ def main() -> None:
 
     mask = commands.add_parser("mask")
     mask.add_argument("image", type=Path)
-    mask.add_argument("--regions", dest="mask", default="mouth")
+    mask.add_argument("--regions", dest="mask", default="inner_mouth")
     mask.add_argument("--dilate", type=int)
     mask.add_argument("--feather", type=float)
     mask.add_argument("--overlay", action="store_true")

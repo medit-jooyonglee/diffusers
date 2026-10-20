@@ -1,0 +1,14 @@
+# BuildKit은 Dockerfile 옆의 <Dockerfile>.dockerignore를 우선 사용한다 (레포 루트 .dockerignore는 건드리지 않음)
+*
+!setup.py
+!pyproject.toml
+!README.md
+!src/
+!my/__init__.py
+!my/design_tune_server.py
+!my/openapi.yaml
+!my/build_smile_embedding_library.py
+!my/smile_design/
+!my/configs/smile_design/
+!docker/design-tune-server/requirements.txt
+**/__pycache__

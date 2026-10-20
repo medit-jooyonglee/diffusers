@@ -1,0 +1,456 @@
+openapi: 3.0.3
+info:
+  title: Smile Design Tune API
+  version: "1.0.0"
+  description: |
+    FLUX.2 Klein 기반 치아/얼굴 편집 추론 서버 (`my/design_tune_server.py`).
+
+    - 텍스트 프롬프트는 스타일 YAML에서 **미리 빌드한 임베딩**을 쓴다. 추론 요청에는 텍스트를 보내지 않고
+      `style_name` + `preset`(또는 control 값)만 보낸다.
+    - 추론 결과는 **PNG 바이너리**로 오고, 메타데이터는 `X-Design-Tune-Metadata` 응답 헤더(JSON)와
+      PNG의 `design_tune` 텍스트 청크에 같이 들어 있다.
+    - 이미지 업로드는 `multipart/form-data`: `parameters`(JSON 문자열) + `images`(파일, 여러 개면 순서대로).
+
+    상세 설명과 예제는 `docs/smile_tune/api.md`.
+servers:
+  - url: /
+    description: 이 문서를 연 서버
+tags:
+  - name: inference
+  - name: styles
+  - name: system
+
+paths:
+  /health:
+    get:
+      tags: [system]
+      summary: 서버 상태와 기본 설정
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Health"}
+
+  /api/v1/infer:
+    post:
+      tags: [inference]
+      summary: 추론 (결과 PNG 반환)
+      description: |
+        `images`는 스타일 layout의 role 순서대로 보낸다. `patient_only`는 환자 사진 1장,
+        `patient_tooth`는 환자 사진 + 치아 템플릿 2장.
+
+        `parameters` 필드는 **JSON 문자열**이다. 스키마는 아래 Schemas의 `InferParameters` 참고.
+        자주 쓰는 형태:
+
+        ```json
+        {"style_name": "smile_final", "layout": "patient_only", "mode": "preset", "preset": "align_whiten",
+         "seed": 0, "mask": {"mode": "inpaint"}}
+        ```
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [parameters, images]
+              properties:
+                parameters:
+                  type: string
+                  description: InferParameters를 JSON으로 직렬화한 문자열
+                  example: '{"style_name": "smile_final", "layout": "patient_only", "mode": "preset", "preset": "align_whiten", "seed": 0, "mask": {"mode": "inpaint"}}'
+                images:
+                  type: array
+                  description: layout role 순서대로 (최대 --max-images, 기본 5)
+                  items: {type: string, format: binary}
+      responses:
+        "200":
+          description: 생성 이미지 (입력과 같은 크기)
+          headers:
+            X-Design-Tune-Metadata:
+              description: InferMetadata (JSON, ASCII escape)
+              schema: {type: string}
+          content:
+            image/png:
+              schema: {type: string, format: binary}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409":
+          description: 임베딩 라이브러리 미빌드, 또는 라이브러리를 빌드한 모델 경로와 서버 --model이 다름
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "413": {$ref: "#/components/responses/TooLarge"}
+        "500": {$ref: "#/components/responses/ServerError"}
+        "507":
+          description: CUDA out of memory
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+
+  /api/v1/mask:
+    post:
+      tags: [inference]
+      summary: 마스크 미리보기 (생성 없음)
+      description: 첫 번째 이미지에서 얼굴 랜드마크로 편집 영역 마스크를 만든다. `overlay=true`면 원본 위에 빨간색으로 겹쳐 반환.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [images]
+              properties:
+                parameters:
+                  type: string
+                  description: '{"mask": MaskOptions(regions/dilate/feather만 사용), "overlay": bool} JSON 문자열'
+                  example: '{"mask": {"regions": ["inner_mouth"], "dilate": 4, "feather": 6}, "overlay": true}'
+                images:
+                  type: array
+                  items: {type: string, format: binary}
+      responses:
+        "200":
+          description: 마스크 PNG (L 모드) 또는 overlay PNG
+          headers:
+            X-Design-Tune-Mask:
+              description: 마스크 메타데이터 (JSON)
+              schema: {type: string}
+          content:
+            image/png:
+              schema: {type: string, format: binary}
+        "400": {$ref: "#/components/responses/BadRequest"}
+
+  /api/v1/styles:
+    get:
+      tags: [styles]
+      summary: 스타일 목록 (preset/control/layout, 임베딩 빌드 여부)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  styles:
+                    type: array
+                    items: {$ref: "#/components/schemas/StyleSummary"}
+
+  /api/v1/styles/{name}:
+    parameters:
+      - $ref: "#/components/parameters/StyleName"
+    get:
+      tags: [styles]
+      summary: 스타일 YAML 원문
+      description: '`Accept: application/json`이면 `{"name", "yaml"}`, 아니면 text/yaml.'
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: {type: string}
+                  yaml: {type: string}
+            text/yaml:
+              schema: {type: string}
+        "404": {$ref: "#/components/responses/NotFound"}
+    put:
+      tags: [styles]
+      summary: 스타일 YAML 생성/수정 (검증 후 저장, 임베딩은 별도 build 필요)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [yaml]
+              properties:
+                yaml: {type: string}
+      responses:
+        "200":
+          description: 저장됨
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: {type: string}
+                  file: {type: string}
+                  template_version: {type: string}
+                  config_hash: {type: string}
+                  library_ready: {type: boolean}
+        "400": {$ref: "#/components/responses/BadRequest"}
+    delete:
+      tags: [styles]
+      summary: 스타일 YAML 삭제 (임베딩 캐시는 남는다)
+      responses:
+        "200":
+          description: 삭제됨
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: {type: string}
+                  deleted: {type: boolean}
+                  file: {type: string}
+                  embedding_cache_retained: {type: boolean}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /api/v1/styles/{name}/build:
+    parameters:
+      - $ref: "#/components/parameters/StyleName"
+    post:
+      tags: [styles]
+      summary: 임베딩 라이브러리 빌드 (비동기)
+      description: |
+        이미 같은 YAML 내용으로 빌드되어 있으면 `200` + `skipped: true`로 바로 끝난다.
+        새로 빌드하면 `202`를 돌려주고, `/api/v1/jobs/{job_id}`로 진행 상태를 확인한다.
+        같은 GPU에서 빌드하면 빌드 동안 추론이 대기한다.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/BuildOptions"}
+            example: {"layouts": ["patient_only"]}
+      responses:
+        "200":
+          description: 이미 빌드됨 (skipped)
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/BuildJob"}
+        "202":
+          description: 빌드 시작
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/BuildJob"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /api/v1/jobs/{job_id}:
+    get:
+      tags: [styles]
+      summary: 빌드 작업 상태
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/BuildJob"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+components:
+  parameters:
+    StyleName:
+      name: name
+      in: path
+      required: true
+      description: 스타일 이름 (YAML 파일 이름 또는 template_version). 영문/숫자/`.`/`_`/`-`
+      schema: {type: string, example: smile_final}
+
+  responses:
+    BadRequest:
+      description: 잘못된 요청 (파라미터 오류, 얼굴 미검출, 이미지 수 불일치 등)
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    NotFound:
+      description: 스타일/작업 없음
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    TooLarge:
+      description: 요청 크기 초과 (--max-request-megabytes, 기본 64MiB)
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    ServerError:
+      description: 추론 실패
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: {type: string}
+      additionalProperties: true
+      description: 상황에 따라 build_endpoint, expected_library, library_model, server_model 등이 추가된다.
+
+    InferParameters:
+      type: object
+      required: [style_name, layout]
+      properties:
+        style_name: {type: string, example: smile_final}
+        layout:
+          type: string
+          description: 스타일의 layout 이름. images 수/순서를 결정한다
+          example: patient_only
+        mode:
+          type: string
+          enum: [preset, anchor, grid, delta]
+          default: preset
+          description: |
+            - preset: `preset` 이름 하나
+            - anchor: `attribute` 하나를 `value`(또는 control_values[attribute])로 보간
+            - grid: `grid` 이름 + control_values로 2D 보간
+            - delta: control_values + delta_strengths로 여러 축 합성
+        preset: {type: string, default: natural, example: align_whiten}
+        control_values:
+          type: object
+          additionalProperties: {type: number}
+          description: control 이름 → 0~100
+          example: {"tooth_color": 75, "alignment": 100}
+        attribute: {type: string, description: anchor 모드}
+        value: {type: number, description: anchor 모드}
+        grid: {type: string, description: grid 모드}
+        delta_strengths:
+          type: object
+          additionalProperties: {type: number}
+          description: delta 모드 축별 강도
+        seed: {type: integer, default: 0}
+        num_steps: {type: integer, description: "기본: 서버 --steps (4)"}
+        guidance_scale: {type: number, description: "기본: 서버 --guidance-scale (1.0)"}
+        mask:
+          description: 생략하면 서버 기본값(--mask, 기본 off). true/false 또는 MaskOptions
+          oneOf:
+            - type: boolean
+            - $ref: "#/components/schemas/MaskOptions"
+
+    MaskOptions:
+      type: object
+      description: 객체로 보내면 enabled 기본값은 true. 생략한 항목은 서버 기본값.
+      properties:
+        enabled: {type: boolean}
+        mode:
+          type: string
+          enum: [inpaint, composite, mice]
+          default: inpaint
+          description: inpaint 권장. composite/mice는 레거시
+        regions:
+          description: 편집 영역. 치아 편집은 inner_mouth (mouth는 입술까지 다시 그린다)
+          oneOf:
+            - type: array
+              items: {$ref: "#/components/schemas/Region"}
+            - type: string
+              description: 쉼표 구분
+          example: ["inner_mouth"]
+        dilate: {type: integer, default: 4, description: 마스크 확장 (px)}
+        feather: {type: number, default: 6, description: 경계 blur 반경 (px)}
+        strength: {type: number, default: 1.0, minimum: 0, exclusiveMinimum: true, maximum: 1, description: inpaint 강도}
+        edits:
+          type: array
+          description: inpaint/mice — 영역별 지시문을 여러 개 조합 (스타일 YAML의 mice.regions 이름)
+          items:
+            type: object
+            required: [prompt]
+            properties:
+              prompt: {type: string, example: teeth_white}
+              region:
+                description: 생략하면 YAML에 정의된 영역
+                oneOf:
+                  - type: array
+                    items: {$ref: "#/components/schemas/Region"}
+                  - type: string
+              dilate: {type: integer}
+        global: {type: string, description: mice 전용}
+        kernel_size: {type: integer, description: mice 전용}
+        temperature: {type: number, description: mice 전용}
+        mice_steps: {type: integer, nullable: true, description: mice 전용}
+        composite: {type: boolean, description: mice 전용}
+        text_tokens: {type: integer, description: mice 전용}
+
+    Region:
+      type: string
+      enum: [upper_lip, lower_lip, lips, inner_mouth, teeth, mouth, face, eyes, cheeks]
+
+    InferMetadata:
+      type: object
+      properties:
+        style_name: {type: string}
+        layout: {type: string}
+        roles: {type: array, items: {type: string}}
+        mix: {type: object, additionalProperties: true}
+        seed: {type: integer}
+        steps: {type: integer}
+        guidance_scale: {type: number}
+        input_size: {type: array, items: {type: integer}}
+        internal_size: {type: array, items: {type: integer}, description: "실제 생성 해상도 (면적 최대 1024x1024, 16의 배수)"}
+        output_size: {type: array, items: {type: integer}}
+        text_encoder_loaded: {type: boolean}
+        mask: {type: object, additionalProperties: true}
+        step_warning: {type: string, nullable: true}
+
+    StyleSummary:
+      type: object
+      properties:
+        name: {type: string}
+        file_name: {type: string}
+        config_hash: {type: string}
+        template_version: {type: string}
+        layouts: {type: array, items: {type: string}}
+        controls: {type: array, items: {type: string}}
+        presets: {type: array, items: {type: string}}
+        grids: {type: array, items: {type: string}}
+        updated_at: {type: string, format: date-time}
+        library_ready: {type: boolean, description: 임베딩 빌드 완료 여부 (false면 infer가 409)}
+        library: {type: string}
+        valid: {type: boolean, description: YAML 오류 시 false (error 포함)}
+        error: {type: string}
+
+    BuildOptions:
+      type: object
+      properties:
+        layouts: {type: array, items: {type: string}, description: 생략하면 전체 layout}
+        kinds:
+          type: array
+          items: {type: string, enum: [base, preset, anchor, grid, mice]}
+        batch_size: {type: integer, minimum: 1}
+        overwrite: {type: boolean, default: false}
+
+    BuildJob:
+      type: object
+      properties:
+        job_id: {type: string}
+        style_name: {type: string}
+        library: {type: string}
+        status: {type: string, enum: [queued, running, succeeded, failed]}
+        skipped: {type: boolean}
+        created_at: {type: string}
+        started_at: {type: string, nullable: true}
+        finished_at: {type: string, nullable: true}
+        return_code: {type: integer, nullable: true}
+        error: {type: string, nullable: true}
+        log: {type: string}
+
+    Health:
+      type: object
+      properties:
+        status: {type: string}
+        model_loaded: {type: boolean}
+        model: {type: string}
+        device: {type: string}
+        dtype: {type: string}
+        running_build_jobs: {type: integer}
+        fp8_weights: {type: boolean}
+        fp8_compute: {type: boolean}
+        compile: {type: string, nullable: true, enum: [full, regional], description: "--compile 설정 (null이면 compile 안 함)"}
+        min_steps_non_distilled: {type: integer}
+        mask:
+          type: object
+          properties:
+            enabled: {type: boolean}
+            mode: {type: string}
+            regions: {type: array, items: {type: string}}
+            dilate: {type: integer}
+            feather: {type: number}
+            available_regions: {type: array, items: {type: string}}
