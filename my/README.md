@@ -448,3 +448,8 @@ nohup env \
 <!-- 
 
   nohup env CUDA_VISIBLE_DEVICES=4,5 HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1 /opt/conda/envs/diffuser_lora/bin/accelerate launch --num_processes 2 --main_process_port 29530 --mixed_precision bf16 my/mydisillation.py --student_config my/student_configure_t2i_b.yaml --cache_dir /data1/jooyonglee/public/flux2_teacher_cache/person_20000_base4b --teacher_model /root/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-base-4B/snapshots/a3b4f4849157f664bdbc776fd7453c2783562f4d --output_dir /data1/jooyonglee/training/diffuers/distillation/flux2-b1-t2i-b-person-scratch-v2 --max_train_samples 4998 --resume_from_checkpoint latest --train_batch_size 1 --gradient_accumulation_steps 2 --max_train_steps 100000 --learning_rate 2e-5 --checkpointing_steps 5000 --validation_steps 1000 --num_validation_images 6 --validation_prompt_file '' --validation_cache_dir /data1/jooyonglee/public/flux2_teacher_cache/person_20000_base4b --cfg_aware_probability 1.0 --cfg_aware_guidance_scale 4.0 --use_ema --ema_device gpu --ema_update_every 10 --gradient_checkpointing --allow_tf32 --dataloader_num_workers 2 --local_files_only > logs/t2i_b_person_scratch_v2_resume7gpu.log 2>&1 & -->
+
+
+TORCHINDUCTOR_CACHE_DIR=$PWD/outputs/inductor_cache TRITON_CACHE_DIR=$PWD/outputs/inductor_cache/triton nohup python my/flux2_klein_t2i_edit_dataset.py --num-images 17000 --output-dir /data1/jooyonglee/public/flux2_klein4b_t2i_edit_17k_2 --seed 0 --fp8-compute --compile regional > logs/klein_t2i_edit_17k.log 2>&1
+
+

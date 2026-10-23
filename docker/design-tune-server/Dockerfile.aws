@@ -1,0 +1,10 @@
+ARG BASE_IMAGE=design-tune-server:local
+FROM ${BASE_IMAGE}
+
+RUN uv pip install --no-cache-dir --constraint /tmp/requirements.txt awscli==1.46.2 \
+    && uv pip check
+
+COPY docker/design-tune-server/start_s3.py /app/start_s3.py
+
+ENTRYPOINT ["python", "/app/start_s3.py"]
+CMD ["/etc/design-tune/deployment.yaml"]

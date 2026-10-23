@@ -1,0 +1,33 @@
+services:
+  server:
+    image: ${DESIGN_TUNE_IMAGE:-design-tune-server:aws}
+    build:
+      context: ../..
+      dockerfile: docker/design-tune-server/Dockerfile.aws
+      args:
+        BASE_IMAGE: ${BASE_IMAGE:-design-tune-server:local}
+    environment:
+      S3_BUCKET: ${S3_BUCKET:?Set S3_BUCKET}
+      S3_PREFIX: ${S3_PREFIX:?Set S3_PREFIX to a release prefix}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:?Set AWS_DEFAULT_REGION}
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    ports:
+      - "127.0.0.1:${DESIGN_TUNE_PORT:-5000}:5000"
+    volumes:
+      - ./deployment.yaml:/etc/design-tune/deployment.yaml:ro
+      - ${ASSET_DIR:?Set ASSET_DIR to an absolute EC2 data directory}/models:/data1/jooyonglee/pretrained/flux2
+      - ${ASSET_DIR:?Set ASSET_DIR to an absolute EC2 data directory}/assets:/assets
+      - inductor-cache:/cache/inductor
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      start_period: 30m
+
+volumes:
+  inductor-cache:

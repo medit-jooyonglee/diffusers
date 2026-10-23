@@ -32,7 +32,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # uv가 관리하는 Python에는 Python.h가 포함되어 있어 triton 컴파일이 동작한다
-RUN curl -LsSf https://astral.sh/uv/0.9.5/install.sh | sh
+RUN curl -fsSL https://astral.sh/uv/0.9.5/install.sh -o /tmp/uv-install.sh \
+    && sh /tmp/uv-install.sh \
+    && rm /tmp/uv-install.sh
 ENV PATH="/root/.local/bin:$PATH" \
     VIRTUAL_ENV=/opt/venv \
     UV_PYTHON_INSTALL_DIR=/opt/uv/python
@@ -48,6 +50,8 @@ WORKDIR /app
 COPY setup.py pyproject.toml README.md ./
 COPY src ./src
 RUN uv pip install --no-cache-dir --no-deps . && rm -rf build
+RUN uv pip check \
+    && python -c "import cv2, mediapipe, torch; from diffusers import Flux2KleinPipeline, Flux2KleinInpaintPipeline; assert torch.__version__.split('+')[0] == '2.9.0'; assert torch.version.cuda == '12.8'"
 
 COPY my/design_tune_server.py my/build_smile_embedding_library.py my/__init__.py my/openapi.yaml ./my/
 COPY my/smile_design ./my/smile_design

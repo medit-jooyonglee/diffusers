@@ -1,0 +1,35 @@
+assets:
+  - prefix: models/klein-4b
+    destination: &model /data1/jooyonglee/pretrained/flux2/models--black-forest-labs--FLUX.2-klein-4B/snapshots/e7b7dc27f91deacad38e78976d1f2b499d76a294
+  - prefix: tokenizers/klein-base-4b
+    destination: /data1/jooyonglee/pretrained/flux2/models--black-forest-labs--FLUX.2-klein-base-4B/snapshots/a3b4f4849157f664bdbc776fd7453c2783562f4d/tokenizer
+  - prefix: libraries
+    destination: /assets/libraries
+  - prefix: mediapipe
+    destination: /assets/mediapipe
+
+required_files:
+  - /data1/jooyonglee/pretrained/flux2/models--black-forest-labs--FLUX.2-klein-4B/snapshots/e7b7dc27f91deacad38e78976d1f2b499d76a294/model_index.json
+  - /data1/jooyonglee/pretrained/flux2/models--black-forest-labs--FLUX.2-klein-base-4B/snapshots/a3b4f4849157f664bdbc776fd7453c2783562f4d/tokenizer/tokenizer_config.json
+  - /assets/libraries/smile_final/ac177319ac4a25f8cd09fbbdc17a82d1a5dd5212f5801dd2a5992ce58254c467/manifest.json
+  - /assets/mediapipe/face_landmarker.task
+
+server_args:
+  - --host
+  - 0.0.0.0
+  - --port
+  - "5000"
+  - --model
+  - *model
+  - --text-encoder-model
+  - /data1/jooyonglee/pretrained/flux2/models--black-forest-labs--FLUX.2-klein-base-4B/snapshots/a3b4f4849157f664bdbc776fd7453c2783562f4d
+  - --styles-dir
+  - /app/my/configs/smile_design
+  - --libraries-dir
+  - /assets/libraries
+  - --face-landmarker-model
+  - /assets/mediapipe/face_landmarker.task
+  - --dtype
+  - bf16
+  - --fp8-weights
+  - --local-files-only
