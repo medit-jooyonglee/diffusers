@@ -1,0 +1,413 @@
+{
+  "teacher_model": "/data1/jooyonglee/pretrained/flux2/models--black-forest-labs--FLUX.2-klein-base-4B/snapshots/a3b4f4849157f664bdbc776fd7453c2783562f4d",
+  "student_checkpoint": "/data1/jooyonglee/training/diffuers/distillation/flux2-b1-editimg-person-v1/checkpoint-24000/transformer_ema",
+  "steps": 50,
+  "guidance_scale": 4.0,
+  "height": 512,
+  "width": 512,
+  "seed": 0,
+  "samples": [
+    {
+      "id": "000004",
+      "instruction": "Zoom out to show more of the surroundings while keeping the person the same.",
+      "reference": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/text2img/000004.png",
+      "target": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/editimg/000004.png"
+    },
+    {
+      "id": "000005",
+      "instruction": "Make the person hold a smartphone.",
+      "reference": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/text2img/000005.png",
+      "target": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/editimg/000005.png"
+    },
+    {
+      "id": "000006",
+      "instruction": "Make the person hold a lantern. Add a face mask to the person.",
+      "reference": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/text2img/000006.png",
+      "target": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/editimg/000006.png"
+    },
+    {
+      "id": "000007",
+      "instruction": "Change the season to winter with snow on the ground.",
+      "reference": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/text2img/000007.png",
+      "target": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/editimg/000007.png"
+    },
+    {
+      "id": "000008",
+      "instruction": "Change the outfit to a doctor's white coat.",
+      "reference": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/text2img/000008.png",
+      "target": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/editimg/000008.png"
+    },
+    {
+      "id": "000009",
+      "instruction": "Change the hairstyle to a curly afro.",
+      "reference": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/text2img/000009.png",
+      "target": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/editimg/000009.png"
+    },
+    {
+      "id": "000010",
+      "instruction": "Replace the background with a desert with dunes. Keep the person exactly the same.",
+      "reference": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/text2img/000010.png",
+      "target": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/editimg/000010.png"
+    },
+    {
+      "id": "000011",
+      "instruction": "Add natural everyday makeup to the person's face.",
+      "reference": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/text2img/000011.png",
+      "target": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/editimg/000011.png"
+    },
+    {
+      "id": "000012",
+      "instruction": "Zoom out to show more of the surroundings while keeping the person the same.",
+      "reference": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/text2img/000012.png",
+      "target": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/editimg/000012.png"
+    },
+    {
+      "id": "000013",
+      "instruction": "Make the person look serious. Change the outfit to a Hawaiian shirt.",
+      "reference": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/text2img/000013.png",
+      "target": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/editimg/000013.png"
+    },
+    {
+      "id": "000014",
+      "instruction": "Add a bow tie to the person.",
+      "reference": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/text2img/000014.png",
+      "target": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/editimg/000014.png"
+    },
+    {
+      "id": "000015",
+      "instruction": "Change the hair color to deep blue.",
+      "reference": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/text2img/000015.png",
+      "target": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/editimg/000015.png"
+    },
+    {
+      "id": "000016",
+      "instruction": "Make the lighting soft and diffused. Add colorful confetti to the scene.",
+      "reference": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/text2img/000016.png",
+      "target": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/editimg/000016.png"
+    },
+    {
+      "id": "000017",
+      "instruction": "Change the pattern of the clothes to a floral print. Add sparkling fireworks in the sky to the scene.",
+      "reference": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/text2img/000017.png",
+      "target": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/editimg/000017.png"
+    },
+    {
+      "id": "000018",
+      "instruction": "Make the person look surprised.",
+      "reference": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/text2img/000018.png",
+      "target": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/editimg/000018.png"
+    },
+    {
+      "id": "000019",
+      "instruction": "Add a wide-brimmed hat to the person.",
+      "reference": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/text2img/000019.png",
+      "target": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/editimg/000019.png"
+    },
+    {
+      "id": "000020",
+      "instruction": "Change the season to spring with cherry blossoms.",
+      "reference": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/text2img/000020.png",
+      "target": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/editimg/000020.png"
+    },
+    {
+      "id": "000021",
+      "instruction": "Change the pose so the person is pointing to the side.",
+      "reference": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/text2img/000021.png",
+      "target": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/editimg/000021.png"
+    },
+    {
+      "id": "000022",
+      "instruction": "Change the weather to light snowfall.",
+      "reference": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/text2img/000022.png",
+      "target": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/editimg/000022.png"
+    },
+    {
+      "id": "000023",
+      "instruction": "Make the person hold a laptop.",
+      "reference": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/text2img/000023.png",
+      "target": "/data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k/editimg/000023.png"
+    }
+  ],
+  "images": [
+    {
+      "role": "teacher",
+      "id": "000004",
+      "instruction": "Zoom out to show more of the surroundings while keeping the person the same.",
+      "elapsed_sec": 21.54,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/teacher/teacher_000004.png"
+    },
+    {
+      "role": "teacher",
+      "id": "000005",
+      "instruction": "Make the person hold a smartphone.",
+      "elapsed_sec": 21.44,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/teacher/teacher_000005.png"
+    },
+    {
+      "role": "teacher",
+      "id": "000006",
+      "instruction": "Make the person hold a lantern. Add a face mask to the person.",
+      "elapsed_sec": 21.59,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/teacher/teacher_000006.png"
+    },
+    {
+      "role": "teacher",
+      "id": "000007",
+      "instruction": "Change the season to winter with snow on the ground.",
+      "elapsed_sec": 21.63,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/teacher/teacher_000007.png"
+    },
+    {
+      "role": "teacher",
+      "id": "000008",
+      "instruction": "Change the outfit to a doctor's white coat.",
+      "elapsed_sec": 21.71,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/teacher/teacher_000008.png"
+    },
+    {
+      "role": "teacher",
+      "id": "000009",
+      "instruction": "Change the hairstyle to a curly afro.",
+      "elapsed_sec": 21.73,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/teacher/teacher_000009.png"
+    },
+    {
+      "role": "teacher",
+      "id": "000010",
+      "instruction": "Replace the background with a desert with dunes. Keep the person exactly the same.",
+      "elapsed_sec": 21.77,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/teacher/teacher_000010.png"
+    },
+    {
+      "role": "teacher",
+      "id": "000011",
+      "instruction": "Add natural everyday makeup to the person's face.",
+      "elapsed_sec": 21.78,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/teacher/teacher_000011.png"
+    },
+    {
+      "role": "teacher",
+      "id": "000012",
+      "instruction": "Zoom out to show more of the surroundings while keeping the person the same.",
+      "elapsed_sec": 21.78,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/teacher/teacher_000012.png"
+    },
+    {
+      "role": "teacher",
+      "id": "000013",
+      "instruction": "Make the person look serious. Change the outfit to a Hawaiian shirt.",
+      "elapsed_sec": 21.78,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/teacher/teacher_000013.png"
+    },
+    {
+      "role": "teacher",
+      "id": "000014",
+      "instruction": "Add a bow tie to the person.",
+      "elapsed_sec": 21.79,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/teacher/teacher_000014.png"
+    },
+    {
+      "role": "teacher",
+      "id": "000015",
+      "instruction": "Change the hair color to deep blue.",
+      "elapsed_sec": 21.79,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/teacher/teacher_000015.png"
+    },
+    {
+      "role": "teacher",
+      "id": "000016",
+      "instruction": "Make the lighting soft and diffused. Add colorful confetti to the scene.",
+      "elapsed_sec": 21.81,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/teacher/teacher_000016.png"
+    },
+    {
+      "role": "teacher",
+      "id": "000017",
+      "instruction": "Change the pattern of the clothes to a floral print. Add sparkling fireworks in the sky to the scene.",
+      "elapsed_sec": 21.85,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/teacher/teacher_000017.png"
+    },
+    {
+      "role": "teacher",
+      "id": "000018",
+      "instruction": "Make the person look surprised.",
+      "elapsed_sec": 21.82,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/teacher/teacher_000018.png"
+    },
+    {
+      "role": "teacher",
+      "id": "000019",
+      "instruction": "Add a wide-brimmed hat to the person.",
+      "elapsed_sec": 21.83,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/teacher/teacher_000019.png"
+    },
+    {
+      "role": "teacher",
+      "id": "000020",
+      "instruction": "Change the season to spring with cherry blossoms.",
+      "elapsed_sec": 21.81,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/teacher/teacher_000020.png"
+    },
+    {
+      "role": "teacher",
+      "id": "000021",
+      "instruction": "Change the pose so the person is pointing to the side.",
+      "elapsed_sec": 21.82,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/teacher/teacher_000021.png"
+    },
+    {
+      "role": "teacher",
+      "id": "000022",
+      "instruction": "Change the weather to light snowfall.",
+      "elapsed_sec": 21.8,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/teacher/teacher_000022.png"
+    },
+    {
+      "role": "teacher",
+      "id": "000023",
+      "instruction": "Make the person hold a laptop.",
+      "elapsed_sec": 21.78,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/teacher/teacher_000023.png"
+    },
+    {
+      "role": "student_ema",
+      "id": "000004",
+      "instruction": "Zoom out to show more of the surroundings while keeping the person the same.",
+      "elapsed_sec": 8.39,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/student_ema/student_ema_000004.png"
+    },
+    {
+      "role": "student_ema",
+      "id": "000005",
+      "instruction": "Make the person hold a smartphone.",
+      "elapsed_sec": 8.35,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/student_ema/student_ema_000005.png"
+    },
+    {
+      "role": "student_ema",
+      "id": "000006",
+      "instruction": "Make the person hold a lantern. Add a face mask to the person.",
+      "elapsed_sec": 8.38,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/student_ema/student_ema_000006.png"
+    },
+    {
+      "role": "student_ema",
+      "id": "000007",
+      "instruction": "Change the season to winter with snow on the ground.",
+      "elapsed_sec": 8.41,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/student_ema/student_ema_000007.png"
+    },
+    {
+      "role": "student_ema",
+      "id": "000008",
+      "instruction": "Change the outfit to a doctor's white coat.",
+      "elapsed_sec": 8.51,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/student_ema/student_ema_000008.png"
+    },
+    {
+      "role": "student_ema",
+      "id": "000009",
+      "instruction": "Change the hairstyle to a curly afro.",
+      "elapsed_sec": 8.43,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/student_ema/student_ema_000009.png"
+    },
+    {
+      "role": "student_ema",
+      "id": "000010",
+      "instruction": "Replace the background with a desert with dunes. Keep the person exactly the same.",
+      "elapsed_sec": 8.45,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/student_ema/student_ema_000010.png"
+    },
+    {
+      "role": "student_ema",
+      "id": "000011",
+      "instruction": "Add natural everyday makeup to the person's face.",
+      "elapsed_sec": 8.52,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/student_ema/student_ema_000011.png"
+    },
+    {
+      "role": "student_ema",
+      "id": "000012",
+      "instruction": "Zoom out to show more of the surroundings while keeping the person the same.",
+      "elapsed_sec": 8.46,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/student_ema/student_ema_000012.png"
+    },
+    {
+      "role": "student_ema",
+      "id": "000013",
+      "instruction": "Make the person look serious. Change the outfit to a Hawaiian shirt.",
+      "elapsed_sec": 8.46,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/student_ema/student_ema_000013.png"
+    },
+    {
+      "role": "student_ema",
+      "id": "000014",
+      "instruction": "Add a bow tie to the person.",
+      "elapsed_sec": 8.47,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/student_ema/student_ema_000014.png"
+    },
+    {
+      "role": "student_ema",
+      "id": "000015",
+      "instruction": "Change the hair color to deep blue.",
+      "elapsed_sec": 8.47,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/student_ema/student_ema_000015.png"
+    },
+    {
+      "role": "student_ema",
+      "id": "000016",
+      "instruction": "Make the lighting soft and diffused. Add colorful confetti to the scene.",
+      "elapsed_sec": 8.48,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/student_ema/student_ema_000016.png"
+    },
+    {
+      "role": "student_ema",
+      "id": "000017",
+      "instruction": "Change the pattern of the clothes to a floral print. Add sparkling fireworks in the sky to the scene.",
+      "elapsed_sec": 8.48,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/student_ema/student_ema_000017.png"
+    },
+    {
+      "role": "student_ema",
+      "id": "000018",
+      "instruction": "Make the person look surprised.",
+      "elapsed_sec": 8.49,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/student_ema/student_ema_000018.png"
+    },
+    {
+      "role": "student_ema",
+      "id": "000019",
+      "instruction": "Add a wide-brimmed hat to the person.",
+      "elapsed_sec": 8.62,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/student_ema/student_ema_000019.png"
+    },
+    {
+      "role": "student_ema",
+      "id": "000020",
+      "instruction": "Change the season to spring with cherry blossoms.",
+      "elapsed_sec": 8.49,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/student_ema/student_ema_000020.png"
+    },
+    {
+      "role": "student_ema",
+      "id": "000021",
+      "instruction": "Change the pose so the person is pointing to the side.",
+      "elapsed_sec": 8.57,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/student_ema/student_ema_000021.png"
+    },
+    {
+      "role": "student_ema",
+      "id": "000022",
+      "instruction": "Change the weather to light snowfall.",
+      "elapsed_sec": 8.51,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/student_ema/student_ema_000022.png"
+    },
+    {
+      "role": "student_ema",
+      "id": "000023",
+      "instruction": "Make the person hold a laptop.",
+      "elapsed_sec": 8.5,
+      "file": "/workspace/repo/mydiffusers/outputs/edit_distill_compare/student_ema/student_ema_000023.png"
+    }
+  ]
+}
