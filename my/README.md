@@ -450,6 +450,72 @@ nohup env \
   nohup env CUDA_VISIBLE_DEVICES=4,5 HF_HUB_OFFLINE=1 PYTHONUNBUFFERED=1 /opt/conda/envs/diffuser_lora/bin/accelerate launch --num_processes 2 --main_process_port 29530 --mixed_precision bf16 my/mydisillation.py --student_config my/student_configure_t2i_b.yaml --cache_dir /data1/jooyonglee/public/flux2_teacher_cache/person_20000_base4b --teacher_model /root/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-base-4B/snapshots/a3b4f4849157f664bdbc776fd7453c2783562f4d --output_dir /data1/jooyonglee/training/diffuers/distillation/flux2-b1-t2i-b-person-scratch-v2 --max_train_samples 4998 --resume_from_checkpoint latest --train_batch_size 1 --gradient_accumulation_steps 2 --max_train_steps 100000 --learning_rate 2e-5 --checkpointing_steps 5000 --validation_steps 1000 --num_validation_images 6 --validation_prompt_file '' --validation_cache_dir /data1/jooyonglee/public/flux2_teacher_cache/person_20000_base4b --cfg_aware_probability 1.0 --cfg_aware_guidance_scale 4.0 --use_ema --ema_device gpu --ema_update_every 10 --gradient_checkpointing --allow_tf32 --dataloader_num_workers 2 --local_files_only > logs/t2i_b_person_scratch_v2_resume7gpu.log 2>&1 & -->
 
 
+
+# editimg
+
+
+export CUDA_VISIBLE_DEVICES=4
+export HF_HUB_OFFLINE=1
+export PYTHONUNBUFFERED=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+nohup python my/mydisillation.py \
+  --teacher_model /data1/jooyonglee/pretrained/flux2/models--black-forest-labs--FLUX.2-klein-base-4B/snapshots/a3b4f4849157f664bdbc776fd7453c2783562f4d \
+  --student_config my/configs/editing/phase2_magicbrush_single_b.yaml \
+  --student_init /data1/jooyonglee/training/diffuers/distillation/flux2-b1-t2i-b-person-scratch-v2/checkpoint-550000/transformer_ema \
+  --editing_dataset_root /data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k \
+  --editing_cache_dir /data1/jooyonglee/public/teacher/flux4b/cache/flux2_klein4b_t2i_edit_17k \
+  --precompute_editing_cache \
+  --public_resolution 512 \
+  --output_dir /data1/jooyonglee/training/diffuers/distillation/flux2-b1-editimg-person-v1 \
+  --train_batch_size 1 \
+  --gradient_accumulation_steps 8 \
+  --max_train_steps 50000 \
+  --checkpointing_steps 1000 \
+  --gradient_checkpointing \
+  --allow_tf32 \
+  --dataloader_num_workers 2 \
+  --ema_device gpu \
+  --validation_steps 1000 \
+  --num_validation_images 4 \
+  --local_files_only > logs/editimg.log 2>&1 &
+
+
+
+nohup env \
+  CUDA_VISIBLE_DEVICES=4 \
+  HF_HUB_OFFLINE=1 \
+  PYTHONUNBUFFERED=1 \
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  /opt/conda/envs/diffuser_lora/bin/python my/mydisillation.py \
+  --teacher_model /data1/jooyonglee/pretrained/flux2/models--black-forest-labs--FLUX.2-klein-base-4B/snapshots/a3b4f4849157f664bdbc776fd7453c2783562f4d \
+  --student_config my/configs/editing/phase2_magicbrush_single_b.yaml \
+  --resume_from_checkpoint latest \
+  --editing_dataset_root /data1/jooyonglee/public/teacher/flux4b/flux2_klein4b_t2i_edit_17k \
+  --editing_cache_dir /data1/jooyonglee/public/teacher/flux4b/cache/flux2_klein4b_t2i_edit_17k \
+  --precompute_editing_cache \
+  --public_resolution 512 \
+  --output_dir /data1/jooyonglee/training/diffuers/distillation/flux2-b1-editimg-person-v1 \
+  --train_batch_size 1 \
+  --gradient_accumulation_steps 8 \
+  --max_train_steps 1000000 \
+  --checkpointing_steps 1000 \
+  --gradient_checkpointing \
+  --allow_tf32 \
+  --dataloader_num_workers 2 \
+  --ema_device gpu \
+  --validation_steps 1000 \
+  --num_validation_images 4 \
+  --local_files_only >> logs/editimg.log 2>&1 &
+
+
+
+<!-- --use_editing_cache \
+  --precompute_editing_cache 실행 및 완료 -->
+
+   nohup tensorboard --logdir_spec="personEdit:/data1/jooyonglee/training/diffuers/distillation/flux2-b1-editimg-person-v1/logs" --port 8605 --host 0.0.0.0 --purge_orphaned_data false --reload_interval 30 --max_reload_threads 4 > logs/board.log 2>&1 &
+
+
 TORCHINDUCTOR_CACHE_DIR=$PWD/outputs/inductor_cache TRITON_CACHE_DIR=$PWD/outputs/inductor_cache/triton nohup python my/flux2_klein_t2i_edit_dataset.py --num-images 17000 --output-dir /data1/jooyonglee/public/flux2_klein4b_t2i_edit_17k_2 --seed 0 --fp8-compute --compile regional > logs/klein_t2i_edit_17k.log 2>&1
 
 

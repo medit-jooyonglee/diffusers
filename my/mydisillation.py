@@ -188,6 +188,8 @@ class CachedFlux2Dataset(Dataset):
 
 
 class MagicBrushDataset(Dataset):
+    dataset_name = "MagicBrush"
+
     def __init__(self, root_dir, mode="single", max_reference_images=1, max_samples=None):
         self.root_dir = Path(root_dir).expanduser()
         metadata_path = self.root_dir / "metadata.jsonl"
@@ -288,6 +290,237 @@ class MagicBrushDataset(Dataset):
         }
 
 
+class GeneratedEditDataset(Dataset):
+    dataset_name = "generated edit pairs"
+
+    def __init__(self, root_dir, mode="single", max_reference_images=1, max_samples=None):
+        self.root_dir = Path(root_dir).expanduser()
+        self.edit_dir = self.root_dir / "editimg"
+        if not self.edit_dir.is_dir():
+            raise ValueError(f"Generated edit image directory not found: {self.edit_dir}")
+        if mode != "single" or max_reference_images != 1:
+            raise ValueError(
+                "Generated edit pairs support only editing_mode=single and editing_max_reference_images=1"
+            )
+
+        metadata_paths = sorted(self.edit_dir.glob("*.json"))
+        if not metadata_paths:
+            raise ValueError(f"No generated edit metadata found in {self.edit_dir}")
+
+        samples = []
+        self.skipped_incomplete = 0
+        for metadata_path in metadata_paths:
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as error:
+                raise ValueError(f"Invalid JSON in {metadata_path}: {error}") from error
+            if not isinstance(metadata, dict):
+                raise ValueError(f"Generated edit metadata must be a JSON object: {metadata_path}")
+
+            sample_id = metadata_path.stem
+            if str(metadata.get("id", sample_id)) != sample_id:
+                raise ValueError(
+                    f"Generated edit id does not match its filename: {metadata_path}"
+                )
+            input_image = metadata.get("input_image")
+            if not isinstance(input_image, str) or not input_image.strip():
+                raise ValueError(f"Generated edit input_image is missing: {metadata_path}")
+
+            reference_path = Path(input_image)
+            if not reference_path.is_absolute():
+                reference_path = self.root_dir / reference_path
+            target_path = self.edit_dir / f"{sample_id}.png"
+            prompt_path = self.edit_dir / f"{sample_id}.txt"
+            if not reference_path.is_file() or not target_path.is_file() or not prompt_path.is_file():
+                self.skipped_incomplete += 1
+                continue
+            prompt = prompt_path.read_text(encoding="utf-8-sig").strip()
+            if not prompt:
+                self.skipped_incomplete += 1
+                continue
+            samples.append(
+                {
+                    "sample_id": sample_id,
+                    "instruction": prompt,
+                    "reference_path": reference_path,
+                    "target_path": target_path,
+                }
+            )
+
+        if max_samples is not None:
+            samples = samples[:max_samples]
+        self.samples = samples
+        if not self.samples:
+            raise ValueError(
+                f"No complete generated edit pairs found in {self.root_dir}. Each editimg JSON needs "
+                "the input_image it names plus editimg PNG and TXT files with the same basename."
+            )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        sample = self.samples[index]
+        with Image.open(sample["target_path"]) as image:
+            target_image = image.convert("RGB")
+        with Image.open(sample["reference_path"]) as image:
+            reference_image = image.convert("RGB")
+        return {
+            "target_image": target_image,
+            "reference_images": [reference_image],
+            "instruction": sample["instruction"],
+            "session_id": sample["sample_id"],
+            "turn_index": 0,
+            "cache_key": sample["sample_id"],
+            "reference_files": [str(sample["reference_path"])],
+            "target_file": str(sample["target_path"]),
+        }
+
+
+def load_editing_dataset(root_dir, mode, max_reference_images, max_samples=None):
+    root_dir = Path(root_dir).expanduser()
+    if (root_dir / "metadata.jsonl").is_file():
+        dataset_class = MagicBrushDataset
+    elif (root_dir / "editimg").is_dir():
+        dataset_class = GeneratedEditDataset
+    else:
+        raise ValueError(
+            f"Editing dataset format not recognized at {root_dir}. Expected metadata.jsonl for MagicBrush "
+            "or an editimg directory for generated edit pairs."
+        )
+    return dataset_class(
+        root_dir=root_dir,
+        mode=mode,
+        max_reference_images=max_reference_images,
+        max_samples=max_samples,
+    )
+
+
+def resolve_editing_cache_dir(editing_dataset_root, editing_cache_dir=None):
+    if editing_cache_dir:
+        return Path(editing_cache_dir).expanduser()
+    dataset_root = Path(editing_dataset_root).expanduser()
+    return dataset_root.parent / "cache" / dataset_root.name
+
+
+class CachedEditingDataset(Dataset):
+    dataset_name = "cached edit pairs"
+    CONFIG_NAME = "cache_config.json"
+
+    def __init__(
+        self,
+        cache_dir,
+        source_root,
+        resolution,
+        teacher_model,
+        mode,
+        max_reference_images,
+        max_samples=None,
+    ):
+        self.cache_dir = Path(cache_dir).expanduser()
+        config_path = self.cache_dir / self.CONFIG_NAME
+        if not config_path.is_file():
+            raise ValueError(
+                f"Editing cache config not found: {config_path}. Run with --precompute_editing_cache first."
+            )
+        self.config = json.loads(config_path.read_text(encoding="utf-8"))
+        expected = {
+            "version": 1,
+            "source_root": str(Path(source_root).expanduser().resolve()),
+            "resolution": resolution,
+            "teacher_model": str(teacher_model),
+            "editing_mode": mode,
+            "max_reference_images": max_reference_images,
+        }
+        actual = {key: self.config.get(key) for key in expected}
+        if actual != expected:
+            raise ValueError(f"Editing cache configuration mismatch: expected={expected}, actual={actual}")
+
+        self.samples = []
+        for sample_dir in sorted(path for path in self.cache_dir.iterdir() if path.is_dir()):
+            latent_path = sample_dir / "latent.pt"
+            embedding_path = sample_dir / "embedding.pt"
+            metadata_path = sample_dir / "metadata.json"
+            reference_paths = sorted(sample_dir.glob("reference_latent_*.pt"))
+            if (
+                latent_path.is_file()
+                and embedding_path.is_file()
+                and metadata_path.is_file()
+                and len(reference_paths) == max_reference_images
+            ):
+                self.samples.append(
+                    (sample_dir, latent_path, embedding_path, reference_paths, metadata_path)
+                )
+        if max_samples is not None:
+            self.samples = self.samples[:max_samples]
+        if not self.samples:
+            raise ValueError(f"No complete editing cache samples found in {self.cache_dir}")
+
+        empty_embedding_path = self.cache_dir / "empty_embedding.pt"
+        if not empty_embedding_path.is_file():
+            raise ValueError(f"Editing cache empty prompt embedding not found: {empty_embedding_path}")
+        self.empty_embedding_path = empty_embedding_path
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        sample_dir, latent_path, embedding_path, reference_paths, metadata_path = self.samples[index]
+        latent = torch.load(latent_path, map_location="cpu", weights_only=True).detach()
+        embedding = torch.load(embedding_path, map_location="cpu", weights_only=True).detach()
+        reference_latents = [
+            torch.load(path, map_location="cpu", weights_only=True).detach()
+            for path in reference_paths
+        ]
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if latent.ndim != 3:
+            raise ValueError(f"{latent_path} must have shape (C,H,W), got {tuple(latent.shape)}")
+        if embedding.ndim != 2:
+            raise ValueError(f"{embedding_path} must have shape (L,D), got {tuple(embedding.shape)}")
+        if any(reference.ndim != 3 for reference in reference_latents):
+            shapes = [tuple(reference.shape) for reference in reference_latents]
+            raise ValueError(f"{sample_dir} reference latents must have shape (C,H,W), got {shapes}")
+        return {
+            "latent": latent,
+            "reference_latents": reference_latents,
+            "embedding": embedding,
+            "prompt": metadata["prompt"],
+        }
+
+    def load_empty_embedding(self):
+        embedding = torch.load(self.empty_embedding_path, map_location="cpu", weights_only=True)
+        if embedding.ndim == 2:
+            embedding = embedding.unsqueeze(0)
+        if embedding.ndim != 3 or embedding.shape[0] != 1:
+            raise ValueError(
+                f"{self.empty_embedding_path} must have shape (L,D) or (1,L,D), got {tuple(embedding.shape)}"
+            )
+        return embedding
+
+
+def editing_cache_is_complete(args):
+    cache_dir = resolve_editing_cache_dir(args.editing_dataset_root, args.editing_cache_dir)
+    try:
+        source_dataset = load_editing_dataset(
+            root_dir=args.editing_dataset_root,
+            mode=args.editing_mode,
+            max_reference_images=args.editing_max_reference_images,
+            max_samples=args.max_train_samples,
+        )
+        cached_dataset = CachedEditingDataset(
+            cache_dir=cache_dir,
+            source_root=args.editing_dataset_root,
+            resolution=args.public_resolution,
+            teacher_model=args.teacher_model,
+            mode=args.editing_mode,
+            max_reference_images=args.editing_max_reference_images,
+            max_samples=args.max_train_samples,
+        )
+    except (FileNotFoundError, ValueError, json.JSONDecodeError):
+        return False, cache_dir, None, None
+    return len(cached_dataset) == len(source_dataset), cache_dir, len(cached_dataset), len(source_dataset)
+
+
 def collate_cached_samples(examples):
     latent_shapes = {tuple(example["latent"].shape) for example in examples}
     embedding_shapes = {tuple(example["embedding"].shape) for example in examples}
@@ -324,9 +557,56 @@ def collate_magicbrush_samples(examples):
         "captions": [example["instruction"] for example in examples],
         "session_ids": [example["session_id"] for example in examples],
         "turn_indices": [example["turn_index"] for example in examples],
+        "cache_keys": [
+            example.get("cache_key", f"{example['session_id']}-{example['turn_index']:04d}")
+            for example in examples
+        ],
         "reference_files": [example["reference_files"] for example in examples],
         "target_files": [example["target_file"] for example in examples],
     }
+
+
+def collate_cached_editing_samples(examples):
+    latent_shapes = {tuple(example["latent"].shape) for example in examples}
+    embedding_shapes = {tuple(example["embedding"].shape) for example in examples}
+    reference_counts = {len(example["reference_latents"]) for example in examples}
+    if len(latent_shapes) != 1:
+        raise ValueError(f"A cached editing batch contains different latent shapes: {sorted(latent_shapes)}")
+    if len(embedding_shapes) != 1:
+        raise ValueError(
+            f"A cached editing batch contains different embedding shapes: {sorted(embedding_shapes)}"
+        )
+    if len(reference_counts) != 1:
+        raise ValueError(
+            f"A cached editing batch contains different reference counts: {sorted(reference_counts)}"
+        )
+    reference_count = reference_counts.pop()
+    return {
+        "latents": torch.stack([example["latent"] for example in examples]),
+        "reference_latents": [
+            torch.stack([example["reference_latents"][index] for example in examples])
+            for index in range(reference_count)
+        ],
+        "embeddings": torch.stack([example["embedding"] for example in examples]),
+        "prompts": [example["prompt"] for example in examples],
+    }
+
+
+def crop_to_square(image, resolution):
+    # preprocess_public_images와 동일한 "짧은 변 기준 리사이즈 + 중앙 crop" 규칙을 PIL 이미지로 반환한다.
+    # 검증/추론 시 레퍼런스 이미지를 학습 때와 다른 해상도/비율로 그대로 넘기면(원본 크기 그대로),
+    # student가 학습 중 한 번도 못 본 형태의 조건을 받아 결과가 크게 깨진다 (레퍼런스의 한쪽 귀퉁이만
+    # 반영된 것처럼 보이는 증상으로 나타남).
+    image = image.convert("RGB")
+    scale = resolution / min(image.size)
+    resized = (
+        max(resolution, round(image.width * scale)),
+        max(resolution, round(image.height * scale)),
+    )
+    image = image.resize(resized, resample=Image.Resampling.LANCZOS)
+    left = (image.width - resolution) // 2
+    top = (image.height - resolution) // 2
+    return image.crop((left, top, left + resolution, top + resolution))
 
 
 def preprocess_public_images(images, resolution):
@@ -392,6 +672,150 @@ def encode_magicbrush_batch(pipeline, batch, resolution, device, dtype):
     return target_latents, reference_latents, prompt_embeds.to(dtype=dtype)
 
 
+def encode_cached_editing_batch(batch, device, dtype):
+    return (
+        batch["latents"].to(device=device, dtype=dtype, non_blocking=True),
+        [
+            latent.to(device=device, dtype=dtype, non_blocking=True)
+            for latent in batch["reference_latents"]
+        ],
+        batch["embeddings"].to(device=device, dtype=dtype, non_blocking=True),
+    )
+
+
+def save_tensor_atomic(tensor, path):
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    torch.save(tensor.detach().to(device="cpu"), temporary_path)
+    temporary_path.replace(path)
+
+
+def write_json_atomic(payload, path):
+    temporary_path = path.with_name(f".{path.name}.tmp")
+    temporary_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(path)
+
+
+@torch.no_grad()
+def build_editing_cache(args, accelerator, dtype):
+    dataset = load_editing_dataset(
+        root_dir=args.editing_dataset_root,
+        mode=args.editing_mode,
+        max_reference_images=args.editing_max_reference_images,
+        max_samples=args.max_train_samples,
+    )
+    cache_dir = resolve_editing_cache_dir(args.editing_dataset_root, args.editing_cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    config_path = cache_dir / CachedEditingDataset.CONFIG_NAME
+    expected_config = {
+        "version": 1,
+        "source_root": str(Path(args.editing_dataset_root).expanduser().resolve()),
+        "resolution": args.public_resolution,
+        "teacher_model": str(args.teacher_model),
+        "editing_mode": args.editing_mode,
+        "max_reference_images": args.editing_max_reference_images,
+    }
+    if config_path.is_file():
+        existing_config = json.loads(config_path.read_text(encoding="utf-8"))
+        actual_config = {key: existing_config.get(key) for key in expected_config}
+        if actual_config != expected_config:
+            raise ValueError(
+                f"Editing cache configuration mismatch at {config_path}: "
+                f"expected={expected_config}, actual={actual_config}"
+            )
+    else:
+        write_json_atomic(expected_config, config_path)
+
+    pipeline = load_public_encoding_pipeline(args, dtype, accelerator.device)
+    empty_embedding_path = cache_dir / "empty_embedding.pt"
+    if not empty_embedding_path.is_file():
+        empty_embedding, _ = pipeline.encode_prompt(prompt=[""], device=accelerator.device)
+        save_tensor_atomic(empty_embedding[0].to(dtype=dtype), empty_embedding_path)
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.editing_cache_batch_size,
+        shuffle=False,
+        num_workers=args.dataloader_num_workers,
+        pin_memory=True,
+        collate_fn=collate_magicbrush_samples,
+        persistent_workers=args.dataloader_num_workers > 0,
+    )
+    created = 0
+    reused = 0
+    progress_bar = tqdm(dataloader, disable=not accelerator.is_local_main_process, desc="Caching edits")
+    for batch in progress_bar:
+        uncached_indices = []
+        for index, cache_key in enumerate(batch["cache_keys"]):
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", cache_key):
+                raise ValueError(f"Unsupported editing cache key: {cache_key!r}")
+            sample_dir = cache_dir / cache_key
+            required_paths = [
+                sample_dir / "latent.pt",
+                sample_dir / "embedding.pt",
+                sample_dir / "metadata.json",
+                *[
+                    sample_dir / f"reference_latent_{reference_index:02d}.pt"
+                    for reference_index in range(args.editing_max_reference_images)
+                ],
+            ]
+            if all(path.is_file() for path in required_paths):
+                reused += 1
+            else:
+                uncached_indices.append(index)
+        if not uncached_indices:
+            progress_bar.set_postfix(created=created, reused=reused)
+            continue
+
+        uncached_batch = {
+            "target_images": [batch["target_images"][index] for index in uncached_indices],
+            "reference_images": [
+                [images[index] for index in uncached_indices]
+                for images in batch["reference_images"]
+            ],
+            "captions": [batch["captions"][index] for index in uncached_indices],
+        }
+        target_latents, reference_latents, embeddings = encode_magicbrush_batch(
+            pipeline,
+            uncached_batch,
+            args.public_resolution,
+            accelerator.device,
+            dtype,
+        )
+        for encoded_index, batch_index in enumerate(uncached_indices):
+            cache_key = batch["cache_keys"][batch_index]
+            sample_dir = cache_dir / cache_key
+            sample_dir.mkdir(parents=True, exist_ok=True)
+            save_tensor_atomic(target_latents[encoded_index], sample_dir / "latent.pt")
+            save_tensor_atomic(embeddings[encoded_index], sample_dir / "embedding.pt")
+            for reference_index, latents in enumerate(reference_latents):
+                save_tensor_atomic(
+                    latents[encoded_index],
+                    sample_dir / f"reference_latent_{reference_index:02d}.pt",
+                )
+            write_json_atomic(
+                {
+                    "cache_key": cache_key,
+                    "prompt": batch["captions"][batch_index],
+                    "reference_files": batch["reference_files"][batch_index],
+                    "target_file": batch["target_files"][batch_index],
+                },
+                sample_dir / "metadata.json",
+            )
+            created += 1
+        progress_bar.set_postfix(created=created, reused=reused)
+
+    final_config = dict(expected_config)
+    final_config["sample_count"] = len(dataset)
+    write_json_atomic(final_config, config_path)
+    accelerator.print(
+        f"Editing cache ready: {cache_dir} ({len(dataset):,} samples, created={created:,}, reused={reused:,})"
+    )
+    return cache_dir
+
+
 @torch.no_grad()
 def load_public_validation_samples(args, pipeline, dtype, device):
     samples = []
@@ -434,7 +858,7 @@ def load_public_validation_samples(args, pipeline, dtype, device):
 @torch.no_grad()
 def load_editing_validation_samples(args, pipeline, dtype, device):
     root_dir = args.validation_editing_dataset_root or args.editing_dataset_root
-    dataset = MagicBrushDataset(
+    dataset = load_editing_dataset(
         root_dir=root_dir,
         mode=args.editing_mode,
         max_reference_images=args.editing_max_reference_images,
@@ -452,7 +876,10 @@ def load_editing_validation_samples(args, pipeline, dtype, device):
                 {
                     "embedding": embedding,
                     "prompt": example["instruction"],
-                    "reference_images": example["reference_images"],
+                    # 학습 때 preprocess_public_images가 적용하는 것과 동일한 crop을 검증 생성에도 적용한다
+                    "reference_images": [
+                        crop_to_square(image, args.public_resolution) for image in example["reference_images"]
+                    ],
                     "reference_files": example["reference_files"],
                     "target_image": example["target_image"],
                     "target_file": example["target_file"],
@@ -1242,7 +1669,11 @@ def calibrate_layer_mapping(
             batch_size=1,
             shuffle=False,
             num_workers=0,
-            collate_fn=collate_magicbrush_samples,
+            collate_fn=(
+                collate_cached_editing_samples
+                if args.use_editing_cache
+                else collate_magicbrush_samples
+            ),
         )
     else:
         calibration_loader = DataLoader(
@@ -1274,13 +1705,18 @@ def calibrate_layer_mapping(
                 dtype,
             )
         elif args.editing_dataset_root:
-            model_input, reference_latents, prompt_embeds = encode_magicbrush_batch(
-                public_encoding_pipeline,
-                batch,
-                args.public_resolution,
-                device,
-                dtype,
-            )
+            if args.use_editing_cache:
+                model_input, reference_latents, prompt_embeds = encode_cached_editing_batch(
+                    batch, device, dtype
+                )
+            else:
+                model_input, reference_latents, prompt_embeds = encode_magicbrush_batch(
+                    public_encoding_pipeline,
+                    batch,
+                    args.public_resolution,
+                    device,
+                    dtype,
+                )
         else:
             model_input = batch["latents"].to(device=device, dtype=dtype)
             prompt_embeds = batch["embeddings"].to(device=device, dtype=dtype)
@@ -1657,6 +2093,10 @@ def parse_args():
     data_source.add_argument("--cache_dir")
     data_source.add_argument("--public_dataset_root")
     data_source.add_argument("--editing_dataset_root")
+    parser.add_argument("--precompute_editing_cache", action="store_true")
+    parser.add_argument("--use_editing_cache", action="store_true")
+    parser.add_argument("--editing_cache_dir")
+    parser.add_argument("--editing_cache_batch_size", type=int, default=1)
     parser.add_argument("--validation_cache_dir")
     parser.add_argument("--validation_public_dataset_root")
     parser.add_argument("--validation_editing_dataset_root")
@@ -1667,7 +2107,7 @@ def parse_args():
     parser.add_argument("--public_resolution", type=int, default=512)
     parser.add_argument("--teacher_model", default=DEFAULT_TEACHER)
     parser.add_argument("--revision")
-    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--output_dir")
     parser.add_argument("--student_config", type=Path, default=DEFAULT_STUDENT_CONFIG)
     parser.add_argument("--student_init")
     parser.add_argument("--student_num_layers", type=int)
@@ -1769,6 +2209,16 @@ def parse_args():
         parser.error(str(error))
     if args.lambda_flow is None:
         args.lambda_flow = args.lambda_kd
+    if not args.precompute_editing_cache and not args.output_dir:
+        parser.error("--output_dir is required unless --precompute_editing_cache is used")
+    if (
+        args.precompute_editing_cache
+        or args.use_editing_cache
+        or args.editing_cache_dir
+    ) and not args.editing_dataset_root:
+        parser.error("Editing cache options require --editing_dataset_root")
+    if args.editing_cache_batch_size < 1:
+        parser.error("--editing_cache_batch_size must be at least 1")
     if args.max_train_steps < 1:
         parser.error("--max_train_steps must be at least 1")
     if args.public_resolution < 16 or args.public_resolution % 16:
@@ -1887,6 +2337,21 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.precompute_editing_cache and not args.output_dir:
+        accelerator = Accelerator(mixed_precision=args.mixed_precision)
+        if accelerator.num_processes != 1:
+            raise ValueError("--precompute_editing_cache must run with one process")
+        set_seed(args.seed)
+        if args.allow_tf32 and torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+        weight_dtype = torch.float32
+        if accelerator.mixed_precision == "fp16":
+            weight_dtype = torch.float16
+        elif accelerator.mixed_precision == "bf16":
+            weight_dtype = torch.bfloat16
+        build_editing_cache(args, accelerator, weight_dtype)
+        return
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1925,8 +2390,26 @@ def main():
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
+    if args.precompute_editing_cache:
+        cache_complete, cache_dir, cached_count, source_count = editing_cache_is_complete(args)
+        if cache_complete:
+            accelerator.print(
+                f"Editing cache already complete: {cache_dir} ({cached_count:,} samples)"
+            )
+        else:
+            if cached_count is not None:
+                accelerator.print(
+                    f"Editing cache incomplete: {cache_dir} ({cached_count:,}/{source_count:,} samples)"
+                )
+            build_editing_cache(args, accelerator, weight_dtype)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        args.use_editing_cache = True
+
     is_public_dataset = args.public_dataset_root is not None
     is_editing_dataset = args.editing_dataset_root is not None
+    is_cached_editing = is_editing_dataset and args.use_editing_cache
     if is_public_dataset:
         dataset = CommonCatalogDataset(
             root_dir=args.public_dataset_root,
@@ -1949,12 +2432,28 @@ def main():
             persistent_workers=args.dataloader_num_workers > 0,
         )
     elif is_editing_dataset:
-        dataset = MagicBrushDataset(
-            root_dir=args.editing_dataset_root,
-            mode=args.editing_mode,
-            max_reference_images=args.editing_max_reference_images,
-            max_samples=args.max_train_samples,
-        )
+        if is_cached_editing:
+            editing_cache_dir = resolve_editing_cache_dir(
+                args.editing_dataset_root, args.editing_cache_dir
+            )
+            dataset = CachedEditingDataset(
+                cache_dir=editing_cache_dir,
+                source_root=args.editing_dataset_root,
+                resolution=args.public_resolution,
+                teacher_model=args.teacher_model,
+                mode=args.editing_mode,
+                max_reference_images=args.editing_max_reference_images,
+                max_samples=args.max_train_samples,
+            )
+            editing_collate_fn = collate_cached_editing_samples
+        else:
+            dataset = load_editing_dataset(
+                root_dir=args.editing_dataset_root,
+                mode=args.editing_mode,
+                max_reference_images=args.editing_max_reference_images,
+                max_samples=args.max_train_samples,
+            )
+            editing_collate_fn = collate_magicbrush_samples
         dataloader = DataLoader(
             dataset,
             batch_size=args.train_batch_size,
@@ -1962,7 +2461,7 @@ def main():
             num_workers=args.dataloader_num_workers,
             pin_memory=True,
             drop_last=True,
-            collate_fn=collate_magicbrush_samples,
+            collate_fn=editing_collate_fn,
             persistent_workers=args.dataloader_num_workers > 0,
         )
     else:
@@ -2037,7 +2536,7 @@ def main():
                 single_mapping = selected_mapping["single"]
                 print(f"Reusing calibrated layer mapping: double={double_mapping}, single={single_mapping}")
             else:
-                if is_public_dataset or is_editing_dataset:
+                if is_public_dataset or (is_editing_dataset and not is_cached_editing):
                     public_encoding_pipeline = load_public_encoding_pipeline(
                         args, weight_dtype, accelerator.device
                     )
@@ -2111,23 +2610,31 @@ def main():
             encoding="utf-8",
         )
 
-    if (
+    validation_enabled = args.validation_epochs > 0 or args.validation_steps > 0
+    needs_encoding_pipeline = (
         is_public_dataset
-        or is_editing_dataset
+        or (is_editing_dataset and not is_cached_editing)
         or args.validation_prompt_file
-    ) and public_encoding_pipeline is None:
+        or (is_editing_dataset and validation_enabled)
+    )
+    if needs_encoding_pipeline and public_encoding_pipeline is None:
         public_encoding_pipeline = load_public_encoding_pipeline(
             args, weight_dtype, accelerator.device
         )
 
     empty_prompt_embedding = None
     if args.unconditional_probability > 0 or args.cfg_aware_probability > 0:
-        empty_prompt_embedding = load_empty_prompt_embedding(
-            args,
-            weight_dtype,
-            accelerator.device,
-            text_pipeline=public_encoding_pipeline,
-        )
+        if is_cached_editing:
+            empty_prompt_embedding = dataset.load_empty_embedding().to(
+                device=accelerator.device, dtype=weight_dtype
+            )
+        else:
+            empty_prompt_embedding = load_empty_prompt_embedding(
+                args,
+                weight_dtype,
+                accelerator.device,
+                text_pipeline=public_encoding_pipeline,
+            )
 
     ema_tracker = None
     if args.use_ema and accelerator.is_main_process:
@@ -2198,12 +2705,14 @@ def main():
             data_mode = f"CommonCatalog streaming: {args.public_dataset_root}"
         elif is_editing_dataset:
             data_mode = (
-                f"MagicBrush {args.editing_mode}: {args.editing_dataset_root} "
+                f"{dataset.dataset_name} {args.editing_mode}: {args.editing_dataset_root} "
                 f"({len(dataset):,} usable samples, {args.editing_max_reference_images} references)"
             )
         else:
             data_mode = f"cache: {args.cache_dir}"
         print(f"Training data mode: {data_mode}")
+        if is_editing_dataset and getattr(dataset, "skipped_incomplete", 0):
+            print(f"Skipped incomplete editing samples: {dataset.skipped_incomplete:,}")
         if args.max_train_samples is not None:
             print(f"Training sample subset: {args.max_train_samples:,} deterministic samples")
         global_batch_size = (
@@ -2257,7 +2766,6 @@ def main():
     validation_samples = None
     validation_pipeline = None
     validation_negative_prompt_embeds = None
-    validation_enabled = args.validation_epochs > 0 or args.validation_steps > 0
     if validation_enabled:
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
@@ -2330,13 +2838,18 @@ def main():
                         weight_dtype,
                     )
                 elif is_editing_dataset:
-                    model_input, reference_latents, prompt_embeds = encode_magicbrush_batch(
-                        public_encoding_pipeline,
-                        batch,
-                        args.public_resolution,
-                        accelerator.device,
-                        weight_dtype,
-                    )
+                    if is_cached_editing:
+                        model_input, reference_latents, prompt_embeds = encode_cached_editing_batch(
+                            batch, accelerator.device, weight_dtype
+                        )
+                    else:
+                        model_input, reference_latents, prompt_embeds = encode_magicbrush_batch(
+                            public_encoding_pipeline,
+                            batch,
+                            args.public_resolution,
+                            accelerator.device,
+                            weight_dtype,
+                        )
                 else:
                     model_input = batch["latents"].to(
                         accelerator.device, dtype=weight_dtype, non_blocking=True
