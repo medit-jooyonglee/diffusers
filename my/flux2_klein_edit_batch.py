@@ -5,6 +5,7 @@ klein-4B 스냅샷에는 텍스트 인코더 가중치가 없어 klein-base-4B�
 
 입력 (둘 중 하나):
   --input-jsonl  한 줄에 {"id": "...", "image": "a.png" 또는 ["a.png", "ref.png"], "prompt": "...", "seed": 0(선택)}
+                 image를 빼면 text-to-image ("width"/"height" 선택, 기본 1024)
   --images-dir + --prompt  폴더의 모든 이미지에 같은 프롬프트 (스모크 테스트용)
 
 출력: <output-dir>/<id>.png, <output-dir>/results.jsonl (이미 있는 id는 건너뛴다 — 중단 후 다시 실행하면 이어서 생성)
@@ -96,10 +97,13 @@ def load_items(args: argparse.Namespace) -> list[dict]:
             if not line.strip():
                 continue
             record = json.loads(line)
-            images = record["image"] if isinstance(record["image"], list) else [record["image"]]
+            # image가 없으면 text-to-image (width/height로 크기 지정, 기본 1024x1024)
+            images = record.get("image") or []
+            images = images if isinstance(images, list) else [images]
             images = [str(Path(p) if Path(p).is_absolute() else base / p) for p in images]
             items.append({"id": str(record.get("id", f"{number:06d}")), "image": images, "prompt": record["prompt"],
-                          "seed": record.get("seed")})
+                          "seed": record.get("seed"), "width": record.get("width", 1024),
+                          "height": record.get("height", 1024)})
     items = items[args.shard_index :: args.num_shards]
     return items[: args.limit] if args.limit else items
 
@@ -159,11 +163,12 @@ def main() -> None:
             record = {"id": item["id"], "prompt": item["prompt"], "image": item["image"]}
             try:
                 images = [ImageOps.exif_transpose(Image.open(p)).convert("RGB") for p in item["image"]]
-                width, height = generation_size(*images[0].size, args.max_area)
+                source_size = images[0].size if images else (item["width"], item["height"])
+                width, height = generation_size(*source_size, args.max_area)
                 seed = args.seed if item.get("seed") is None else int(item["seed"])
                 t0 = time.time()
                 output = pipeline(
-                    image=images,
+                    image=images or None,
                     prompt=item["prompt"],
                     height=height,
                     width=width,
@@ -174,7 +179,7 @@ def main() -> None:
                 elapsed = time.time() - t0
                 path = args.output_dir / f"{item['id']}.png"
                 output.save(path)
-                record.update(status="ok", output=str(path), seed=seed, input_size=list(images[0].size),
+                record.update(status="ok", output=str(path), seed=seed, input_size=list(source_size),
                               size=[width, height], seconds=round(elapsed, 2))
             except Exception as error:  # 한 건이 실패해도 나머지는 계속 생성
                 record.update(status="error", error=f"{type(error).__name__}: {error}")
