@@ -960,7 +960,13 @@ def _stage_parameters(
 def plan_design_stages(
     config: dict[str, Any], requested: dict[str, float], closed_mouth: bool, find_preset=None
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """요청값을 '마스크 없는 큰 변화' → '치아 inpaint' 순서의 단계로 나눈다."""
+    """요청값을 '치아 inpaint' → '마스크 없는 큰 변화' 순서의 단계로 나눈다.
+
+    치아를 먼저 만든다. 고개/웃음 단계는 입까지 다시 그리므로, 치아를 나중에 하면 결손·금속 같은
+    구조적 결함이 남은 채로 좁은 마스크 안에서 복구해야 한다 (sample17: 검은 틈이 그대로 남음).
+    치아를 먼저 메우면 고개 단계가 메워진 치열을 그대로 돌려 그린다 — 색은 조금 덜 희어지지만
+    (b* 0.2 → 4.8) 치열 자체가 자연스럽다. 색보다 자연스러움을 기준으로 정한 순서다.
+    """
     defaults = default_values(config)
     changed = {name: value for name, value in requested.items() if value != defaults.get(name)}
     teeth = {k: v for k, v in changed.items() if k in TEETH_CONTROLS}
@@ -969,9 +975,11 @@ def plan_design_stages(
     stages: list[dict[str, Any]] = []
     warnings: list[str] = []
 
+    opening_mouth = False
     if closed_mouth and teeth and not smile and "smile" in config["controls"]:
-        # 다문 입에 치아만 걸면 닫힌 입술 안에 치아가 삽입된다 → 먼저 입을 벌린다
+        # 다문 입에 치아만 걸면 닫힌 입술 안에 치아가 삽입된다 → 이때만 입을 먼저 벌린다
         smile = {"smile": CLOSED_MOUTH_SMILE}
+        opening_mouth = True
         warnings.append(
             f"Mouth is closed; opening it with smile={CLOSED_MOUTH_SMILE:g} first. "
             "Identity similarity drops markedly, so present the result as a simulation."
@@ -979,11 +987,11 @@ def plan_design_stages(
 
     # 고개와 웃음을 따로 돌리면 뒤 단계가 앞 단계를 되돌린다 (실측: 웃음 0.94 → 0.17).
     # 두 축을 한 문장으로 인코딩한 조합 preset이 있으면 한 단계로 합친다.
-    combined = {**pose, **smile}
+    big: list[dict[str, Any]] = []
     if pose and smile:
-        merged = _stage_parameters(config, combined, None, find_preset)
+        merged = _stage_parameters(config, {**pose, **smile}, None, find_preset)
         if merged.get("mode") == "preset":
-            stages.append({"stage": "pose_smile", **merged, "mask": False})
+            big.append({"stage": "pose_smile", **merged, "mask": False})
             pose, smile = {}, {}
         else:
             warnings.append(
@@ -996,14 +1004,26 @@ def plan_design_stages(
         stage = _stage_parameters(config, values, grid, find_preset)
         if not stage:
             raise ValueError(f"No exact embedding for {name} {sorted(values)}; add a combination preset")
-        stages.append({"stage": name, **stage, "mask": False})
+        big.append({"stage": name, **stage, "mask": False})
 
+    teeth_stage = None
     if teeth:
         stage = _stage_parameters(config, teeth, "align_color", find_preset)
         if not stage:
             raise ValueError(f"No exact embedding for teeth {sorted(teeth)}; add a combination preset")
-        stages.append({"stage": "teeth", **stage, "mask": dict(TEETH_MASK)})
-    if stages and stages[-1]["stage"] != "teeth":
+        teeth_stage = {"stage": "teeth", **stage, "mask": dict(TEETH_MASK)}
+
+    if opening_mouth:
+        # 입을 벌리려고 넣은 단계는 치아보다 먼저 와야 한다 (닫힌 입술 안에 치아를 넣을 수 없다)
+        stages.extend(big)
+        if teeth_stage:
+            stages.append(teeth_stage)
+    else:
+        if teeth_stage:
+            stages.append(teeth_stage)
+        stages.extend(big)
+
+    if stages and not teeth_stage:
         warnings.append("No tooth edit was requested, so the whole image is regenerated and identity drops.")
     return stages, warnings
 
@@ -1254,7 +1274,7 @@ def create_app(args: argparse.Namespace | None = None) -> Flask:
             current, stage_log = patient, []
             for index, stage in enumerate(stages):
                 name = stage["stage"]
-                # 템플릿은 치아 단계에서만 참조로 쓴다 (고개/웃음 단계는 환자 사진 1장)
+                # 템플릿은 치아 단계에서만 참조로 쓴다 (고개/웃음 단계는 직전 단계 결과 1장)
                 use_template = template is not None and name == "teeth"
                 stage_images = [current, template] if use_template else [current]
                 stage_parameters = {

@@ -189,6 +189,7 @@ wandb
 *.png
 *.jps
 *.txt
+!docker/design-tune-server/requirements.txt
 *.json
 *.pkl
 *.pt

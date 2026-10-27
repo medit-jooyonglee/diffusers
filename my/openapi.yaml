@@ -88,6 +88,69 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/Error"}
 
+  /api/v1/design:
+    post:
+      tags: [inference]
+      summary: 설정만 보내면 서버가 마스크·순서·단계를 정해 처리 (앱 연동용, 권장)
+      description: |
+        `/api/v1/infer`와 달리 **마스크 / layout / mode / preset / 가중치를 보내지 않는다.**
+        control 값을 최상위 필드로 보내면 서버가 아래 규칙대로 처리하고 최종 이미지 1장을 돌려준다.
+
+        ```
+        바꿀 것 없음     → 추론하지 않고 원본 반환 (unchanged: true)
+        치아만          → inpaint(inner_mouth, dilate 8) 1회
+        고개/웃음만      → 마스크 없이 1회
+        고개 + 웃음      → 조합 preset이 있으면 1회, 없으면 2회 (warnings에 기록)
+        치아 + 큰 변화   → 순차: 치아 inpaint 먼저 → 고개/웃음(마스크 없음)
+        입을 다물고 있음  → 자동 2단계: 웃음 75로 입을 벌린 뒤 → 치아 inpaint (이때만 치아가 뒤)
+        ```
+
+        치아를 먼저 하는 이유: 고개/웃음 단계는 입까지 다시 그려 결손·금속 같은 구조적 결함을 키운다.
+        그 뒤 좁은 마스크 안에서는 복구되지 않는다. 치아를 먼저 메우면 고개 단계가 그대로 돌려 그린다.
+
+        조합은 **실제 문장을 인코딩한 임베딩만** 쓴다 (조합 preset → grid → anchor). `delta`는 쓰지 않는다.
+        자세한 근거는 `docs/smile_tune/tunning_guide.md`.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [parameters, images]
+              properties:
+                parameters:
+                  type: string
+                  description: DesignParameters를 JSON으로 직렬화한 문자열
+                  example: '{"style_name": "smile_final_smile_v3", "tooth_color": 75, "alignment": 100, "seed": 0}'
+                images:
+                  type: array
+                  description: 환자 사진 1장, 또는 환자 사진 + 치아 템플릿 2장 (템플릿은 치아 단계에서만 참조로 쓰인다)
+                  items: {type: string, format: binary}
+      responses:
+        "200":
+          description: 생성 이미지 (입력과 같은 크기). 변경 사항이 없으면 원본 그대로
+          headers:
+            X-Design-Tune-Metadata:
+              description: DesignMetadata (JSON, ASCII escape)
+              schema: {type: string}
+          content:
+            image/png:
+              schema: {type: string, format: binary}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409":
+          description: 임베딩 라이브러리 미빌드, 또는 라이브러리를 빌드한 모델과 서버 --model이 다름
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "413": {$ref: "#/components/responses/TooLarge"}
+        "500": {$ref: "#/components/responses/ServerError"}
+        "507":
+          description: CUDA out of memory
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+
   /api/v1/mask:
     post:
       tags: [inference]
@@ -278,6 +341,56 @@ components:
           schema: {$ref: "#/components/schemas/Error"}
 
   schemas:
+    DesignParameters:
+      type: object
+      required: [style_name]
+      description: |
+        control 값은 **최상위 필드**로 보낸다. 보내지 않은 control은 "원본 유지"로 둔다
+        (`smile`/`head_yaw`/`head_pitch`는 50, `tooth_color`/`alignment`는 0이 유지).
+        `mask`, `layout`, `mode`, `preset`, `grid`, `control_values`, `delta_strengths`는 **보내지 않는다.**
+      properties:
+        style_name: {type: string, example: smile_final_smile_v3}
+        tooth_color: {type: number, description: "치아 색 0(유지)/50/75/100", example: 75}
+        alignment: {type: number, description: "치아 배열 0(유지)/50/75/100", example: 100}
+        head_yaw: {type: number, description: "고개 좌우 50(유지)/25/75. 0과 100은 변화가 과하다"}
+        head_pitch: {type: number, description: "고개 상하 50(유지)/25/75"}
+        smile: {type: number, description: "웃는 정도 50(유지)/0/25/75/100"}
+        seed: {type: integer, default: 0, description: "앱에서 항상 명시한다. 생략하면 매번 결과가 달라진다"}
+        open_closed_mouth:
+          type: boolean
+          default: true
+          description: 다문 입일 때 웃음으로 먼저 벌리는 자동 2단계. false면 끈다
+    DesignMetadata:
+      type: object
+      properties:
+        style_name: {type: string}
+        requested: {type: object, additionalProperties: {type: number}, description: 요청된 control 값}
+        seed: {type: integer}
+        mouth_openness:
+          type: object
+          description: 얼굴 폭² 대비 ×1000. teeth < 2 또는 inner_mouth < 5면 다문 입으로 본다
+          properties:
+            inner_mouth: {type: number}
+            teeth: {type: number}
+            face_width: {type: number}
+        closed_mouth: {type: boolean, description: 다문 입으로 판정해 자동 2단계를 거쳤는지}
+        unchanged: {type: boolean, description: "true면 추론 없이 원본을 그대로 반환했다"}
+        identity_warning:
+          type: boolean
+          description: "true면 고개·웃음이 포함돼 신원이 떨어진다 → 결과를 '참고용 시뮬레이션'으로 표시한다"
+        warnings: {type: array, items: {type: string}}
+        stages:
+          type: array
+          description: 실제로 수행한 단계 (디버깅용)
+          items:
+            type: object
+            properties:
+              stage: {type: string, enum: [pose, smile, pose_smile, teeth]}
+              index: {type: integer}
+              template: {type: boolean, description: 이 단계에서 치아 템플릿을 참조로 썼는지}
+              seconds: {type: number}
+              mix: {type: object, description: 사용한 임베딩 (mode, preset 등)}
+              mask: {type: object}
     Error:
       type: object
       required: [error]
