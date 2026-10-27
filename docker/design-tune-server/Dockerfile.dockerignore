@@ -1,14 +1,34 @@
-# BuildKit은 Dockerfile 옆의 <Dockerfile>.dockerignore를 우선 사용한다 (레포 루트 .dockerignore는 건드리지 않음)
+# BuildKit은 Dockerfile 옆의 <Dockerfile>.dockerignore를 우선 사용한다 (레포 루트 .dockerignore는 건드리지 않음).
+#
+# 허용 목록 방식이다: 첫 줄 `*`로 전부 막고 필요한 코드만 `!`로 통과시킨다.
+# 그래서 docs/, outputs/, weights/, my/samples/, examples/, tests/ 같은 문서·이미지·결과물은 애초에 들어가지 않는다.
+# 모델 가중치와 임베딩 라이브러리도 포함하지 않는다 (실행할 때 볼륨으로 마운트하거나 S3에서 받는다).
 *
+
+# 패키지 설치용 (README.md는 setup.py가 long_description으로 읽는다)
 !setup.py
 !pyproject.toml
 !README.md
+
+# diffusers 라이브러리 본체 (설치 후 Dockerfile에서 /app/src를 지운다)
 !src/
+
+# 서버 코드
 !my/__init__.py
 !my/design_tune_server.py
-!my/openapi.yaml
 !my/build_smile_embedding_library.py
+!my/openapi.yaml
 !my/smile_design/
+
+# 스타일 YAML (총 64KB). 실제로 쓰는 스타일만 두고 싶으면 개별 파일로 좁힌다
 !my/configs/smile_design/
+
+# 런타임 의존성 목록
 !docker/design-tune-server/requirements.txt
+
+# 위에서 통과시킨 경로 안의 빌드 부산물은 다시 제외한다
 **/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.egg-info
+**/.pytest_cache

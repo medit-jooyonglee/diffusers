@@ -1,16 +1,23 @@
-# design_tune_server.py 배포 이미지 (docs/smile_tune/deployment_review.md)
+# design_tune_server.py 배포 이미지
+#
+# 이미지에는 **코드만** 들어간다. 모델 가중치, 임베딩 라이브러리, 얼굴 랜드마크 모델, 샘플/문서/결과 이미지는
+# 포함하지 않는다 (Dockerfile.dockerignore가 허용 목록 방식으로 코드만 통과시킨다).
+# 앱이 쓰는 엔드포인트는 POST /api/v1/design 이다 (docs/smile_tune/tunning_guide.md).
 #
 # 빌드 (레포 루트에서):
 #   DOCKER_BUILDKIT=1 docker build -f docker/design-tune-server/Dockerfile -t design-tune-server .
 #
 # 실행: 모델 가중치 / face_landmarker / 임베딩 라이브러리 / compile 캐시는 볼륨으로 마운트한다.
 #   모델은 임베딩을 빌드했을 때와 같은 경로로 마운트해야 한다 (manifest의 model 경로와 --model이 같아야 추론 허용).
-#   docker run --gpus '"device=0"' -p 5000:5000 \
+#   아래는 AWS 배포(compose.aws.yaml, deployment.yaml)와 같은 설정이다 — 로컬에서도 같은 조건으로 확인하려면 그대로 쓴다.
+#   docker run --gpus '"device=0"' -p 8603:5000 \
 #     -v /data1/jooyonglee/pretrained/flux2:/data1/jooyonglee/pretrained/flux2:ro \
 #     -v $PWD/weights:/app/weights:ro \
 #     -v $PWD/outputs/design_tune_embedding_libraries:/app/outputs/design_tune_embedding_libraries \
 #     -v design-tune-inductor-cache:/cache/inductor \
-#     design-tune-server --fp8-compute --compile regional
+#     design-tune-server --fp8-weights
+#
+#   fp8 연산까지 쓰려면 `--fp8-compute --compile regional`을 붙인다 (torchao 필요, 첫 요청에 수십 초 컴파일).
 
 FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04
 
@@ -47,9 +54,12 @@ COPY docker/design-tune-server/requirements.txt /tmp/requirements.txt
 RUN uv pip install --no-cache-dir -r /tmp/requirements.txt
 
 WORKDIR /app
+# README.md는 setup.py가 long_description으로 읽기 때문에 필요하다.
+# 설치가 끝나면 /app/src는 site-packages와 중복이므로 지운다 (약 28MB).
 COPY setup.py pyproject.toml README.md ./
 COPY src ./src
-RUN uv pip install --no-cache-dir --no-deps . && rm -rf build
+RUN uv pip install --no-cache-dir --no-deps . \
+    && rm -rf build src setup.py pyproject.toml
 RUN uv pip check \
     && python -c "import cv2, mediapipe, torch; from diffusers import Flux2KleinPipeline, Flux2KleinInpaintPipeline; assert torch.__version__.split('+')[0] == '2.9.0'; assert torch.version.cuda == '12.8'"
 

@@ -1,13 +1,174 @@
-# Smile Design 튜닝 서버 — 앱 연동 가이드
+# Smile Design 튜닝 서버 — 앱 연동 가이드 (최종)
 
-데스크톱/웹 앱에서 `my/design_tune_server.py`를 호출할 때 알아야 할 것과 **주의사항**을 정리한다.
-현재 테스트 기준 스타일은 **`smile_final_smile_v3`** (웃는 정도 + 치아 + 고개 방향).
+앱은 **설정만 보낸다.** 마스크, 처리 순서, 단계 수, 조합 방식은 서버가 정한다.
 
-- 서버 실행 방법과 전체 옵션: [README.md](README.md)
-- API 스펙 전체: [api.md](api.md), 또는 서버의 Swagger `/docs`
-- 설정별 결과와 권장 조합의 근거: [../final/README.md](../final/README.md), [../final/sample17_report.md](../final/sample17_report.md)
+- 전용 엔드포인트: **`POST /api/v1/design`** (구현 완료)
+- 기준 스타일: **`smile_final_smile_v3`**
+- 서버 실행과 옵션: [README.md](README.md) · 전체 API: [api.md](api.md) 또는 서버의 `/docs`
+- 설정별 결과의 근거: [../final/README.md](../final/README.md)
 
-## 1. 서버 실행
+---
+
+## 1. 앱에서 바꿀 것 (지시)
+
+기존에 `/api/v1/infer`로 직접 호출하던 코드를 아래대로 고친다.
+
+1. **호출 대상을 `POST /api/v1/design`으로 바꾼다.** `/api/v1/infer`는 유지되지만 앱에서 쓰지 않는다.
+2. **`mask`를 보내지 않는다.** 마스크 종류·영역·dilate·feather를 요청에서 모두 제거한다. 서버가 편집 종류에 맞춰 정한다.
+3. **`layout`을 보내지 않는다.** 이미지를 1장 보내면 `patient_only`, 2장 보내면 `patient_tooth`로 서버가 판단한다.
+4. **`mode`, `preset`, `grid`, `attribute`, `control_values`를 보내지 않는다.** 대신 control 값을 **최상위 필드**로 보낸다
+   (`tooth_color`, `alignment`, `head_yaw`, `head_pitch`, `smile`).
+5. **`delta`와 `delta_strengths`를 완전히 제거한다.** 가중치 슬라이더가 있으면 UI에서 뺀다.
+   측정 결과 조합이 깨진다 — 고개+웃음을 `delta`로 합치면 고개 회전이 23.7° → 1.3°로 사라졌다.
+6. **단계를 앱에서 체이닝하지 않는다.** 고개·웃음·치아를 한 요청에 함께 보내면 서버가 순서대로 처리하고 최종 이미지 1장을 돌려준다.
+7. **`seed`를 항상 명시한다.** 생략하면 매번 결과가 달라진다. "다시 생성"에서만 값을 바꾼다.
+8. **`num_steps`를 보내지 않는다.** 4 step 고정이다. 올리면 오히려 나빠진다(sample17: b\* 2.6 → 3.1 → 3.7).
+9. **고개는 25 / 75만 노출한다.** 0과 100은 변화가 과하다.
+10. **요청을 직렬로 보낸다.** 서버에 GPU 락이 있어 동시에 보내도 순서대로 처리된다. 앱에서 큐로 관리하고 진행 표시를 둔다.
+11. **응답 헤더 `X-Design-Tune-Metadata`를 읽는다.** `identity_warning`이 `true`면 결과를 **"참고용 시뮬레이션"으로 표시**한다.
+12. **`unchanged`가 `true`면** 서버가 추론 없이 원본을 그대로 돌려준 것이다. "변경 없음"으로 처리한다.
+13. **스타일 변경 API를 호출하지 않는다.** `PUT`/`DELETE /api/v1/styles/{name}`, `POST …/build`. `PUT`으로 YAML이 바뀌면 이후 모든 추론이 409가 된다.
+
+### 앱에 노출할 설정
+
+| 노출한다 | 노출하지 않는다 |
+| --- | --- |
+| 치아 미백 (0/50/100) | 마스크 종류·영역·dilate·feather |
+| 치아 정렬 (0/50/100) | step 수 |
+| 치아 템플릿 사용 여부 | 조합 모드(preset/anchor/grid/delta) |
+| (선택) 고개 25/75 | 가중치(`delta_strengths`) |
+| (선택) 웃음 0/25/75/100 | layout |
+| seed | 처리 순서·단계 수 |
+
+---
+
+## 2. `POST /api/v1/design` 사용법
+
+`multipart/form-data`로 `parameters`(JSON 문자열)와 `images`(파일)를 보낸다.
+응답은 **PNG 바이너리**, 설정은 `X-Design-Tune-Metadata` 헤더(JSON)와 PNG의 `design_tune` 청크.
+
+### 요청 필드
+
+| 필드 | 필수 | 설명 |
+| --- | --- | --- |
+| `style_name` | O | `"smile_final_smile_v3"` |
+| `tooth_color` | | 0(유지) / 50 / 75 / 100 |
+| `alignment` | | 0(유지) / 50 / 75 / 100 |
+| `head_yaw` | | 50(유지) / 25 / 75 |
+| `head_pitch` | | 50(유지) / 25 / 75 |
+| `smile` | | 50(유지) / 0 / 25 / 75 / 100 |
+| `seed` | | 기본 0 |
+| `open_closed_mouth` | | 기본 `true`. 다문 입 자동 2단계를 끄려면 `false` |
+| `images` | O | 환자 사진 1장, 또는 환자 사진 + 치아 템플릿 2장 |
+
+### 예시
+
+**치아만 (가장 많이 쓰는 형태)**
+```json
+{"style_name":"smile_final_smile_v3","tooth_color":75,"alignment":100,"seed":0}
+```
+
+**치아 + 템플릿** — `images`에 환자 사진, 템플릿 순서로 2장
+```json
+{"style_name":"smile_final_smile_v3","tooth_color":75,"alignment":100,"seed":0}
+```
+
+**고개 + 웃음 + 치아** — 한 요청으로 보내면 서버가 2단계로 처리한다
+```json
+{"style_name":"smile_final_smile_v3","head_yaw":75,"smile":100,"tooth_color":75,"alignment":100,"seed":0}
+```
+
+### 응답 메타데이터
+
+```json
+{"style_name":"smile_final_smile_v3",
+ "requested":{"smile":100.0,"head_yaw":75.0,"tooth_color":75.0,"alignment":100.0},
+ "seed":0,
+ "mouth_openness":{"inner_mouth":34.5,"teeth":16.1,"face_width":379.0},
+ "closed_mouth":false, "unchanged":false, "identity_warning":true, "warnings":[],
+ "stages":[{"stage":"pose_smile","index":0,"template":false,"seconds":3.34,
+            "mix":{"mode":"preset","preset":"yaw75_smile_full"},"mask":{"enabled":false}},
+           {"stage":"teeth","index":1,"template":false,"seconds":2.1,
+            "mix":{"mode":"preset","preset":"align_whiten"},"mask":{"enabled":true,"regions":["inner_mouth"]}}]}
+```
+
+| 필드 | 쓰임 |
+| --- | --- |
+| `unchanged` | `true`면 원본 그대로 반환 (추론 0회, 약 0.2초) |
+| `identity_warning` | `true`면 고개·웃음이 포함돼 신원이 떨어진다 → **참고용 표시** |
+| `closed_mouth` | 다문 입으로 판정돼 자동 2단계를 거쳤는지 |
+| `warnings` | 사람이 읽을 수 있는 경고 문장 |
+| `stages` | 몇 단계로 어떤 임베딩을 썼는지 (디버깅용) |
+
+---
+
+## 3. 서버가 자동으로 하는 일
+
+```
+바꿀 것이 없음        → 추론하지 않고 원본 반환
+치아만               → inpaint 1회
+고개/웃음만           → 마스크 없이 1회
+고개 + 웃음           → 조합 preset이 있으면 1회, 없으면 2회 (경고)
+큰 변화 + 치아        → 순차: 큰 변화 먼저(마스크 없음) → 치아 inpaint 마지막
+입이 다물려 있음       → 자동 2단계: 웃음 75로 입을 벌린 뒤 → 치아 inpaint
+```
+
+| 편집 | 마스크 | 근거 |
+| --- | --- | --- |
+| **치아 (미백·정렬)** | `inpaint`, **`inner_mouth`, dilate 8, feather 6** | `mouth`는 입술까지 다시 그린다 (입술 변화 8.8 vs 4.4) |
+| 고개 방향 | **없음** | 머리 전체를 다시 그려야 한다 |
+| 웃는 정도 | **없음** | 입 모양이 커지면 마스크를 벗어나 잘린다 (최대 38%) |
+
+**치아를 마지막에 두는 이유**: 앞 단계는 마스크 없이 전체를 다시 그리므로 먼저 고친 치아를 되돌린다.
+실측으로 치아→고개 순서는 b\* 4.4, 반대 순서는 −0.07이었다.
+
+**다문 입 판정** (얼굴 폭² 대비 ×1000): `teeth` < 2 또는 `inner_mouth` < 5.
+실제 샘플 28장에서 다문 입은 1.6 / 0.1, 벌린 입은 17.5 / 6.9 이상이라 경계가 뚜렷하다.
+
+**조합 방식**: `delta`(덧셈)는 쓰지 않는다. **조합 preset → grid → anchor** 순으로 실제 문장을 인코딩한 임베딩만 쓴다.
+
+---
+
+## 4. 조합 preset 추가하기
+
+고개와 웃음을 따로 돌리면 뒤 단계가 앞 단계를 되돌린다(실측: 웃음 0.94 → 0.17).
+두 축을 **한 문장으로 인코딩한 조합 preset**을 YAML에 넣으면 서버가 자동으로 찾아 쓴다.
+
+현재 `smile_final_smile_v3.yaml`에 6개가 있다.
+
+| preset | head_yaw | smile |
+| --- | --- | --- |
+| `yaw25_smile_closed` / `_upper` / `_full` | 25 | 0 / 75 / 100 |
+| `yaw75_smile_closed` / `_upper` / `_full` | 75 | 0 / 75 / 100 |
+
+**효과** (6명, 고개 75 + 웃음 100 + 정렬 100 + 미백 75):
+
+| 방식 | yaw | 웃음 | 치아 b\* |
+| --- | --- | --- | --- |
+| delta 한 번에 | **1.3°** | 0.94 | 12.4 |
+| 순차 고개→웃음 | 23.7° | 0.72 | 12.9 |
+| 순차 웃음→고개 | 22.9° | **0.60** | 11.3 |
+| **조합 preset** | **19.4°** | **0.81** | **−0.2** |
+
+**추가 방법**: `my/configs/smile_design/smile_final_smile_v3.yaml`의 `presets:`에 control 값을 적고 재빌드한다.
+
+```yaml
+  yaw25_smile_upper:
+    head_yaw: 25
+    smile: 75
+```
+
+```bash
+curl -X POST localhost:8603/api/v1/styles/smile_final_smile_v3/build -H 'Content-Type: application/json' -d '{}'
+```
+
+- 서버는 **control 값이 정확히 일치하는 preset**을 manifest에서 찾는다. 이름은 자유롭다.
+- **서버 코드를 고칠 필요가 없다.**
+- YAML을 저장하면 임베딩 해시가 바뀌어 **재빌드가 끝날 때까지 추론이 409**가 된다 (약 30~60초).
+
+---
+
+## 5. 서버 실행
 
 ```bash
 cd /workspace/repo/mydiffusers
@@ -16,195 +177,75 @@ HF_HUB_OFFLINE=1 python my/design_tune_server.py --port 8603 --device cuda:0
 
 | 항목 | 값 |
 | --- | --- |
-| 포트 | 8601 이상 사용 (앱 기본값은 8603) |
-| 준비 완료 신호 | 로그에 `Running on http://0.0.0.0:8603` (약 1분) |
-| 종료 | Ctrl+C |
-| 백그라운드 실행 | `HF_HUB_OFFLINE=1 nohup python my/design_tune_server.py --port 8603 --device cuda:0 > logs/server.log 2>&1 &` |
+| 포트 | 8601 이상 (앱 기본 8603) |
+| 준비 완료 | 로그에 `Running on http://0.0.0.0:8603` (약 1분) |
+| 백그라운드 | `... > logs/server.log 2>&1 &` |
 | Swagger | `http://<서버 IP>:8603/docs` |
 | 상태 확인 | `curl -s http://127.0.0.1:8603/health` |
+| 기본 설정 | fp8 가중치 저장 + bf16 연산. 옵션 불필요 |
 
-`--styles-dir` 기본값이 `my/configs/smile_design`이라 v3 스타일이 자동으로 잡힌다. 추가 옵션은 필요 없다.
+모델은 **첫 추론 요청 때** 로드된다. `/health`가 200이어도 GPU 추론 준비 완료를 뜻하지 않는다.
 
-**GPU 메모리**: 모델은 첫 추론 요청 때 로드된다. 그래서 `/health`가 200이어도 GPU 추론이 된다는 뜻은 아니다.
-로드 후 약 7.7GB를 점유한다.
+### 에러 코드
 
-## 2. 앱이 보낼 기본값
-
-| 항목 | 값 |
-| --- | --- |
-| 엔드포인트 | `POST /api/v1/infer` |
-| 형식 | `multipart/form-data` |
-| 필드 | `parameters` (JSON **문자열**) + `images` (파일, layout 순서대로) |
-| `style_name` | `smile_final_smile_v3` |
-| 응답 | **PNG 바이너리**. 설정은 `X-Design-Tune-Metadata` 응답 헤더(JSON)와 PNG의 `design_tune` 텍스트 청크 |
-| 출력 크기 | **입력 첫 번째 이미지와 같은 크기** |
-| 소요 시간 | 장당 약 1.7~2.7초 (첫 요청은 모델 로드로 수십 초) |
-
-```
-POST /api/v1/infer
-  parameters = {"style_name":"smile_final_smile_v3","layout":"patient_only","mode":"preset",
-                "preset":"align_whiten","seed":0,
-                "mask":{"mode":"inpaint","regions":["mouth"],"dilate":16,"feather":12}}
-  images     = <환자 사진>
-```
-
-## 3. 쓸 수 있는 설정
-
-### preset
-
-| 분류 | 이름 | 내용 |
+| 코드 | 의미 | 앱에서 |
 | --- | --- | --- |
-| 기본 | `natural` | 변화 없음 |
-| 미백 | `whitening_natural` / `whitening_only` | 색 50 / 100 |
-| 정렬 | `align_snaggle` / `align_only` | 배열 50 / 100 |
-| **치아 조합(권장)** | `align_whiten` | 정렬 100 + 미백 75 |
-| 웃는 정도 | `smile_closed`(0) / `smile_closed_lip`(25) / `smile_upper`(75) / `smile_full`(100) | 0 = 입 다묾, 75 = 윗니만, 100 = 윗니+아랫니 |
-| 웃음 + 치아 | `smile_upper_align_whiten` / `smile_full_align_whiten` | 웃음 + 정렬 100 + 미백 75 |
-| 고개 | `turn_left` / `turn_right` / `look_up` / `look_down` | yaw 0/100, pitch 100/0 |
-| 조합(실험용) | `pose_teeth_exact` / `cmb4_exact` / `cmb4b_exact` | 고개 + 치아(+웃음)를 한 문장으로 |
-
-### control (슬라이더)
-
-`smile`, `alignment`, `tooth_color`, `head_yaw`, `head_pitch` — 각각 **0 / 25 / 50 / 75 / 100**.
-`smile`, `head_yaw`, `head_pitch`는 **50이 "원본 유지"**이고, `alignment`와 `tooth_color`는 **0이 "원본 유지"**다.
-
-```json
-{"mode":"anchor","attribute":"tooth_color","control_values":{"tooth_color":75}}
-{"mode":"grid","grid":"align_color","control_values":{"alignment":100,"tooth_color":75}}
-```
-
-`grid`는 `align_color`(정렬×미백)와 `yaw_pitch`(좌우×상하) 두 가지만 있다.
-
-## 4. 주의사항
-
-### 4.1 마스크를 반드시 용도에 맞게 보낸다 — 가장 흔한 실수
-
-| 편집 | `mask` | 이유 |
-| --- | --- | --- |
-| 치아(미백/정렬) | `{"mode":"inpaint","regions":["mouth"],"dilate":16,"feather":12}` | 입만 다시 그리고 나머지는 원본 픽셀 유지 |
-| 웃는 정도 | `{"mode":"inpaint","regions":["mouth","cheeks"],"dilate":24,"feather":16}` | 입꼬리·볼이 움직여야 함 |
-| **고개 방향** | **`false`** | 머리 전체를 다시 그려야 함 |
-
-**고개 방향 요청에 입 마스크를 보내면 입만 다시 그려져서 고개가 전혀 돌아가지 않는다.** 에러도 나지 않으므로
-"설정이 안 먹는다"로 오해하기 쉽다. `mask`를 생략하면 서버 기본값(마스크 꺼짐)이 적용된다.
-
-### 4.2 고개 + 치아는 2단계로 보낸다
-
-한 번에 처리하면 효과가 약해진다. **고개를 먼저 바꾸고, 그 결과 이미지를 다시 보내 치아를 편집**한다.
-
-```
-1단계: images=[환자]        preset=turn_right,    mask=false          → 결과 A
-2단계: images=[결과 A]      preset=align_whiten,  mask=입 영역        → 최종
-```
-
-순서를 반대로 하면(치아 → 고개) 고개 단계에서 치아가 다시 그려져 효과가 절반쯤 사라진다
-(실측: 치아 노란기 b\* 2.6 → 5.0, 올바른 순서는 0.2). 근거는 [sample17_report.md](../final/sample17_report.md) 2장.
-
-한 번에 꼭 해야 한다면 `mode: "delta"`가 아니라 **조합 preset**(`pose_teeth_exact`)을 쓴다.
-`delta`는 축이 늘어나면 고개 회전이 사라진다([../final/embedding_modes.md](../final/embedding_modes.md)).
-
-### 4.3 요청은 한 번에 하나씩 처리된다
-
-서버에 GPU 락이 있어서 **동시에 보내도 순서대로 처리**된다. 에러는 나지 않지만 그만큼 기다린다.
-앱에서 여러 장을 돌릴 때는 순차 호출하고, 진행 표시를 두는 편이 좋다.
-
-### 4.4 layout이 요구하는 이미지 수를 정확히 맞춘다
-
-| layout | 이미지 |
-| --- | --- |
-| `patient_only` | 환자 사진 1장 |
-| `patient_tooth` | 환자 사진 + 치아 템플릿, **정확히 2장** |
-
-수가 다르면 `400 Layout 'patient_tooth' requires 2 images in order ['patient','tooth'], got 1`이 난다.
-**템플릿은 권장하지 않는다** — 조합 프롬프트와 결과가 비슷하고, 템플릿의 분홍 입술색이 환자 입술로 번진다
-([../final/README.md](../final/README.md) 4.2절).
-
-### 4.5 스타일을 바꾸는 API를 호출하지 않는다
-
-`PUT /api/v1/styles/{name}`, `DELETE /api/v1/styles/{name}`, `POST /api/v1/styles/{name}/build`는
-**앱에서 호출하지 않는다.** Swagger 화면에서 실수로 실행하는 경우도 조심한다.
-
-- `PUT`으로 YAML이 바뀌면 임베딩 해시가 달라져서 **이후 모든 추론이 409**가 된다 (재빌드 필요, 약 20초).
-- `DELETE`는 스타일을 지운다. 서버를 재시작해도 파일이 돌아오지 않는다.
-
-### 4.6 얼굴이 검출되지 않으면 400
-
-마스크를 쓰는 요청은 MediaPipe로 얼굴을 찾는다. 실패하면 **GPU 추론 전에** 400을 반환한다.
-얼굴이 작거나 심하게 기울어진 사진, 입이 가려진 사진에서 발생할 수 있다.
-마스크 영역은 `POST /api/v1/mask`로 미리 확인할 수 있다(생성하지 않고 마스크만 반환).
-
-### 4.7 같은 요청은 같은 결과다 (seed)
-
-`seed`를 고정하면 같은 입력·같은 설정에서 항상 같은 이미지가 나온다. 생략하면 매번 달라진다.
-**앱에서는 `seed`를 명시**하고, "다시 생성" 기능을 둘 때만 seed를 바꾼다.
-
-### 4.8 입력 이미지
-
-| 항목 | 내용 |
-| --- | --- |
-| 형식 | PNG / JPEG 등. RGBA도 되고 서버가 RGB로 변환한다 |
-| EXIF 회전 | 서버가 자동 보정한다 |
-| 장수 | 요청당 최대 5장 |
-| 요청 크기 | 최대 64MiB. 넘으면 **413** |
-| 내부 해상도 | 약 1MP를 넘으면 비율을 유지한 채 줄여서 생성하고, **출력은 원본 크기로 되돌린다** |
-
-### 4.9 에러 코드
-
-| 코드 | 의미 | 앱에서 할 일 |
-| --- | --- | --- |
-| 400 | 파라미터 오류, 이미지 수 불일치, **얼굴 미검출** | 메시지를 그대로 보여 준다 |
-| 404 | 없는 스타일 이름 | `style_name` 확인 |
-| 409 | 임베딩 미빌드 또는 모델 불일치 | 운영자에게 알린다 (앱에서 빌드 호출 금지) |
-| 413 | 요청이 64MiB 초과 | 이미지를 줄여 재전송 |
+| 400 | 파라미터 오류, 이미지 수 불일치, **얼굴 미검출** | 메시지를 그대로 표시 |
+| 404 | 없는 스타일 | `style_name` 확인 |
+| 409 | 임베딩 미빌드 / 모델 불일치 | 운영자에게 알림 (앱에서 빌드 호출 금지) |
+| 413 | 요청 64MiB 초과 | 이미지를 줄여 재전송 |
 | 500 | 추론 실패 | 재시도 후에도 나면 서버 로그 확인 |
 | 507 | GPU 메모리 부족 | 잠시 후 재시도 |
 
-## 5. 요청 예시
+입력 이미지: PNG/JPEG, RGBA 가능(서버가 RGB 변환), EXIF 회전 자동 보정, 요청당 최대 5장.
+약 1MP를 넘으면 줄여서 생성하고 **출력은 원본 크기로 되돌린다.**
 
-치아 미백·정렬 (가장 많이 쓸 형태):
-```json
-{"style_name":"smile_final_smile_v3","layout":"patient_only","mode":"preset","preset":"align_whiten","seed":0,
- "mask":{"mode":"inpaint","regions":["mouth"],"dilate":16,"feather":12}}
-```
+---
 
-미백만 / 정렬만:
-```json
-{"style_name":"smile_final_smile_v3","layout":"patient_only","mode":"preset","preset":"whitening_only","seed":0,
- "mask":{"mode":"inpaint","regions":["mouth"],"dilate":16,"feather":12}}
-```
+## 6. 치아 템플릿
 
-슬라이더로 세기 조절:
-```json
-{"style_name":"smile_final_smile_v3","layout":"patient_only","mode":"grid","grid":"align_color",
- "control_values":{"alignment":100,"tooth_color":50},"seed":0,
- "mask":{"mode":"inpaint","regions":["mouth"],"dilate":16,"feather":12}}
-```
+템플릿 이미지를 두 번째로 보내면 **치아가 덜 표백되고 질감이 산다.**
 
-웃는 정도 (입 다물기):
-```json
-{"style_name":"smile_final_smile_v3","layout":"patient_only","mode":"preset","preset":"smile_closed","seed":0,
- "mask":{"mode":"inpaint","regions":["mouth","cheeks"],"dilate":24,"feather":16}}
-```
+| | 치아 b\* | 결과 |
+| --- | --- | --- |
+| 템플릿 없음 | 1~3 | 균일한 흰 덩어리(틀니 느낌)가 되기 쉽다 |
+| **템플릿 사용** | **6~11** | 치아 하나하나가 구분되고 음영이 산다 |
 
-고개 방향 (마스크 끄기):
-```json
-{"style_name":"smile_final_smile_v3","layout":"patient_only","mode":"preset","preset":"turn_right","seed":0,"mask":false}
-```
+**b\*가 낮을수록 좋은 것이 아니다.** 1~3은 과하게 표백된 상태다.
+다만 원본 치아가 거의 없는 케이스에서는 누런 치아가 남을 수 있으니 **선택 옵션**으로 둔다.
 
-## 6. 현재 알려진 한계
+템플릿은 **치아 단계에서만** 참조로 쓰인다. 고개·웃음 단계는 환자 사진 1장만 쓴다.
+
+---
+
+## 7. 알려진 한계
 
 | 항목 | 내용 |
 | --- | --- |
-| 웃음 75(윗니만) | 이미 아랫니가 보이는 얼굴에서 거의 동작하지 않는다 (합성 얼굴 112장 중 19%) |
-| 웃음 100(아랫니까지) | 절반 정도만 동작한다 (42~45%) |
-| 웃음 0 | 잘 동작하지만 아래 얼굴을 크게 다시 그려 **인상이 달라질 수 있다** |
-| 고개 방향 | 배경·머리카락도 함께 바뀐다. 근접 촬영은 **구도가 넓어진다** |
-| 극단값 | 고개 0/100은 과하다. **25/75가 자연스럽다** |
-| `natural` | 변화가 없어야 하는데 치아에 얼룩이 생긴 사례가 있다. 원본을 그대로 보여 줘야 하면 **추론하지 말고 원본을 쓴다** |
-| 금속 보철 | 완전히 지워지지 않는다 |
+| **신원 유지** | 치아만 0.89~0.96 / 고개·웃음 포함 0.26~0.62. **참고용 시뮬레이션으로 표시** |
+| 웃음 75(윗니만) | 이미 아랫니가 보이는 얼굴에서 거의 동작하지 않는다 (112장 중 19%) |
+| 웃음 100 | 절반 정도만 동작 (42~45%) |
+| 고개 방향 | 배경·머리카락도 바뀐다. 근접 촬영은 구도가 넓어진다 |
+| 조합 preset | 고개가 단독 적용(23.7°)보다 약간 약하다(19.4°) |
+| 금속 보철 | 완전히 지워지지 않는다 (지시문에 제거 문구가 없음) |
+| 검증 범위 | 실제 사진 28장 + 합성 얼굴 112장. **실제 임상 사진으로 추가 검증 필요** |
 
-## 7. 스타일 전환 (참고)
+---
 
-`smile_final_smile_v3`는 **실험용**이다. 배포용으로 확정된 스타일은 `smile_final`(웃는 정도 없음)이고,
-AWS 배포 설정도 그쪽을 참조한다. 앱에서 스타일을 바꿀 수 있게 하려면 `style_name`만 교체하면 된다.
-단, `smile_final`에는 `smile_*` preset이 없고 `patient_tooth` 임베딩도 빌드돼 있지 않다.
+## 8. 스타일 전환
+
+`smile_final_smile_v3`는 **실험용**이다. 배포 확정 스타일은 `smile_final`(웃는 정도 없음)이고 AWS 배포도 그쪽을 참조한다.
+앱에서는 `style_name`만 바꾸면 된다. 단 `smile_final`에는 `smile_*` preset과 조합 preset이 없고 `patient_tooth` 임베딩도 빌드돼 있지 않다.
+
+## 9. 근거 데이터
+
+| 내용 | 위치 |
+| --- | --- |
+| 조합 preset 효과 (6명) | `outputs/combo_preset_test/` |
+| 고개+웃음 조합 방식 비교 | `outputs/pose_smile_combo/` |
+| `/api/v1/design` 동작 확인 (7가지) | `outputs/design_api_test/` |
+| 처리 순서 비교 | `outputs/order_compare/` |
+| 자연스러움·템플릿·마스크 영역 (10명) | `outputs/natural_compare/` |
+| 입 다문 환자 2단계 (6명) | `outputs/closed_mouth/` |
+| inpaint vs 마스크 없음 (28명) | `outputs/inpaint_vs_direct/` |
+| 임베딩 조합 방식 | `outputs/mode_compare/`, [../final/embedding_modes.md](../final/embedding_modes.md) |

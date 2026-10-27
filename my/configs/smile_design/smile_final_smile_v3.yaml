@@ -95,6 +95,27 @@ presets:
     head_yaw: 75
     alignment: 100
     tooth_color: 75
+  # 고개 + 웃음 조합 preset. 두 축을 따로 돌리면 뒤 단계가 앞 단계를 되돌리고(실측: 웃음 0.94 → 0.17),
+  # delta 덧셈으로 합치면 고개가 아예 사라진다(23.7도 → 1.3도). 그래서 조합을 한 문장으로 인코딩해 둔다.
+  # 서버는 control 값이 정확히 일치하는 preset을 manifest에서 찾아 자동으로 쓴다 (design_tune_server.exact_preset_finder).
+  yaw25_smile_closed:
+    head_yaw: 25
+    smile: 0
+  yaw25_smile_upper:
+    head_yaw: 25
+    smile: 75
+  yaw25_smile_full:
+    head_yaw: 25
+    smile: 100
+  yaw75_smile_closed:
+    head_yaw: 75
+    smile: 0
+  yaw75_smile_upper:
+    head_yaw: 75
+    smile: 75
+  yaw75_smile_full:
+    head_yaw: 75
+    smile: 100
   whitening_natural:
     tooth_color: 50
   whitening_only:

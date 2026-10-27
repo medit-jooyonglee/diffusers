@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import uuid
 from dataclasses import dataclass, field
@@ -27,10 +28,15 @@ from PIL import Image, ImageFilter, ImageOps, PngImagePlugin
 from diffusers import Flux2KleinInpaintPipeline, Flux2KleinPipeline
 
 from smile_design.embedding_library import EmbeddingLibrary
-from smile_design.face_mask import MASK_REGIONS, FaceMasker, parse_regions
+from smile_design.face_mask import FACE_OVAL, MASK_REGIONS, FaceMasker, parse_regions
 from smile_design.mice import MiceAttention, MiceEdit, PromptLengthCounter
 from smile_design.inference import load_transformer_override
-from smile_design.prompt_templates import build_prompt_entries, load_experiment_config, reference_roles
+from smile_design.prompt_templates import (
+    build_prompt_entries,
+    default_values,
+    load_experiment_config,
+    reference_roles,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -892,6 +898,116 @@ def parse_parameters() -> dict[str, Any]:
     return parameters
 
 
+# /api/v1/design 전용 상수. 근거는 docs/smile_tune/tunning_guide.md 1장.
+TEETH_CONTROLS = ("tooth_color", "alignment")
+POSE_CONTROLS = ("head_yaw", "head_pitch")
+TEETH_MASK = {"mode": "inpaint", "regions": ["inner_mouth"], "dilate": 8, "feather": 6}
+# 얼굴 폭² 대비 ×1000. 실측에서 다문 입은 inner_mouth 1.6 / teeth 0.1, 벌린 입은 17.5 / 6.9 이상이었다
+CLOSED_MOUTH_INNER = 5.0
+CLOSED_MOUTH_TEETH = 2.0
+CLOSED_MOUTH_SMILE = 75.0  # 입을 벌릴 때 쓰는 smile 값 (75 = 윗니만 보이는 미소)
+
+
+def mouth_openness(masker: FaceMasker, image: Image.Image) -> dict[str, float]:
+    """입 안쪽 / 치아 영역 넓이를 얼굴 폭² 대비 ×1000으로 잰다."""
+    masks, points = masker.region_masks(image)
+    face_x = points[FACE_OVAL, 0]
+    width = float(face_x.max() - face_x.min())
+    if width <= 0:
+        raise ValueError("Could not measure face width")
+    scale = 1000.0 / (width * width)
+    return {
+        "inner_mouth": float((masks["inner_mouth"] > 0).sum()) * scale,
+        "teeth": float((masks["teeth"] > 0).sum()) * scale,
+        "face_width": width,
+    }
+
+
+def exact_preset_finder(library: EmbeddingLibrary, layout: str):
+    """control 값이 정확히 일치하는 preset 이름을 찾는다 (실제 문장을 인코딩한 임베딩).
+
+    YAML에 조합 preset을 추가하기만 하면 서버 코드를 고치지 않아도 그 조합이 쓰인다.
+    """
+    presets = {}
+    for record in library.entries.values():
+        if record.get("kind") != "preset" or record.get("layout") != layout or not record.get("preset"):
+            continue
+        key = tuple(sorted((name, float(value)) for name, value in record["values"].items()))
+        presets.setdefault(key, record["preset"])
+
+    def find(values: dict[str, float]) -> str | None:
+        return presets.get(tuple(sorted((name, float(value)) for name, value in values.items())))
+
+    return find
+
+
+def _stage_parameters(
+    config: dict[str, Any], values: dict[str, float], grid: str | None, find_preset=None
+) -> dict[str, Any]:
+    """조합 문장 preset → grid → anchor 순으로 고른다. delta(덧셈)는 조합이 깨지므로 쓰지 않는다."""
+    if find_preset is not None:
+        preset = find_preset(default_values(config) | values)
+        if preset:
+            return {"mode": "preset", "preset": preset}
+    if len(values) == 1:
+        attribute, value = next(iter(values.items()))
+        return {"mode": "anchor", "attribute": attribute, "control_values": {attribute: value}}
+    if grid and grid in config.get("grids", {}):
+        return {"mode": "grid", "grid": grid, "control_values": dict(values)}
+    return {}
+
+
+def plan_design_stages(
+    config: dict[str, Any], requested: dict[str, float], closed_mouth: bool, find_preset=None
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """요청값을 '마스크 없는 큰 변화' → '치아 inpaint' 순서의 단계로 나눈다."""
+    defaults = default_values(config)
+    changed = {name: value for name, value in requested.items() if value != defaults.get(name)}
+    teeth = {k: v for k, v in changed.items() if k in TEETH_CONTROLS}
+    pose = {k: v for k, v in changed.items() if k in POSE_CONTROLS}
+    smile = {k: v for k, v in changed.items() if k == "smile"}
+    stages: list[dict[str, Any]] = []
+    warnings: list[str] = []
+
+    if closed_mouth and teeth and not smile and "smile" in config["controls"]:
+        # 다문 입에 치아만 걸면 닫힌 입술 안에 치아가 삽입된다 → 먼저 입을 벌린다
+        smile = {"smile": CLOSED_MOUTH_SMILE}
+        warnings.append(
+            f"Mouth is closed; opening it with smile={CLOSED_MOUTH_SMILE:g} first. "
+            "Identity similarity drops markedly, so present the result as a simulation."
+        )
+
+    # 고개와 웃음을 따로 돌리면 뒤 단계가 앞 단계를 되돌린다 (실측: 웃음 0.94 → 0.17).
+    # 두 축을 한 문장으로 인코딩한 조합 preset이 있으면 한 단계로 합친다.
+    combined = {**pose, **smile}
+    if pose and smile:
+        merged = _stage_parameters(config, combined, None, find_preset)
+        if merged.get("mode") == "preset":
+            stages.append({"stage": "pose_smile", **merged, "mask": False})
+            pose, smile = {}, {}
+        else:
+            warnings.append(
+                "No combination preset for this pose + smile pair, so they run as two full regenerations "
+                "and the later one partly undoes the earlier. Add a combination preset to the style YAML."
+            )
+    for name, values, grid in (("pose", pose, "yaw_pitch"), ("smile", smile, None)):
+        if not values:
+            continue
+        stage = _stage_parameters(config, values, grid, find_preset)
+        if not stage:
+            raise ValueError(f"No exact embedding for {name} {sorted(values)}; add a combination preset")
+        stages.append({"stage": name, **stage, "mask": False})
+
+    if teeth:
+        stage = _stage_parameters(config, teeth, "align_color", find_preset)
+        if not stage:
+            raise ValueError(f"No exact embedding for teeth {sorted(teeth)}; add a combination preset")
+        stages.append({"stage": "teeth", **stage, "mask": dict(TEETH_MASK)})
+    if stages and stages[-1]["stage"] != "teeth":
+        warnings.append("No tooth edit was requested, so the whole image is regenerated and identity drops.")
+    return stages, warnings
+
+
 def load_uploaded_images(max_images: int) -> list[Image.Image]:
     files = request.files.getlist("images")
     if not files:
@@ -1097,6 +1213,98 @@ def create_app(args: argparse.Namespace | None = None) -> Flask:
             raise
         except Exception as error:
             app.logger.exception("Design Tune inference failed")
+            return json_error(f"Inference failed: {error}", 500)
+
+    @app.post("/api/v1/design")
+    def design():
+        """치아/고개/웃음 설정만 받고 마스크·순서·단계 수는 서버가 정한다 (tunning_guide.md 1장)."""
+        try:
+            parameters = parse_parameters()
+            style_name = safe_style_name(parameters["style_name"])
+            style_path, _, config, _ = store.read(style_name)
+            library_path = store.library_path(style_name, style_path)
+            if not (library_path / "manifest.json").is_file():
+                return json_error(
+                    f"Embedding library is not built for style {style_name}",
+                    409,
+                    build_endpoint=f"/api/v1/styles/{style_name}/build",
+                )
+            library = EmbeddingLibrary(library_path)
+            if library.manifest.get("model") != args.model:
+                return json_error("Embedding library model does not match the server model", 409)
+
+            requested = {name: float(parameters[name]) for name in config["controls"] if name in parameters}
+            images = load_uploaded_images(args.max_images)
+            patient = images[0]
+            template = images[1] if len(images) > 1 else None
+
+            openness = mouth_openness(engine.masker, patient)
+            closed = openness["inner_mouth"] < CLOSED_MOUTH_INNER or openness["teeth"] < CLOSED_MOUTH_TEETH
+            if not bool(parameters.get("open_closed_mouth", True)):
+                closed = False
+            find_preset = exact_preset_finder(library, "patient_only")
+            stages, warnings = plan_design_stages(config, requested, closed, find_preset)
+
+            seed = int(parameters.get("seed", 0))
+            common = {"style_name": parameters["style_name"], "seed": seed}
+            for key in ("num_steps", "steps", "guidance_scale"):
+                if key in parameters:
+                    common[key] = parameters[key]
+
+            current, stage_log = patient, []
+            for index, stage in enumerate(stages):
+                name = stage["stage"]
+                # 템플릿은 치아 단계에서만 참조로 쓴다 (고개/웃음 단계는 환자 사진 1장)
+                use_template = template is not None and name == "teeth"
+                stage_images = [current, template] if use_template else [current]
+                stage_parameters = {
+                    **common,
+                    **{k: v for k, v in stage.items() if k != "stage"},
+                    "layout": "patient_tooth" if use_template else "patient_only",
+                }
+                started = time.time()
+                current, stage_metadata = engine.infer(library, config, stage_parameters, stage_images)
+                stage_log.append({
+                    "stage": name,
+                    "index": index,
+                    "template": use_template,
+                    "seconds": round(time.time() - started, 2),
+                    "mix": stage_metadata["mix"],
+                    "mask": stage_metadata["mask"],
+                })
+
+            metadata = {
+                "style_name": parameters["style_name"],
+                "requested": requested,
+                "seed": seed,
+                "mouth_openness": {k: round(v, 1) for k, v in openness.items()},
+                "closed_mouth": closed,
+                "stages": stage_log,
+                "unchanged": not stages,
+                "identity_warning": any(s["stage"] != "teeth" for s in stage_log),
+                "warnings": warnings,
+                "text_encoder_loaded": False,
+            }
+            output = io.BytesIO()
+            png_info = PngImagePlugin.PngInfo()
+            png_info.add_text("design_tune", json.dumps(metadata, ensure_ascii=False))
+            current.save(output, format="PNG", pnginfo=png_info)
+            output.seek(0)
+            response = send_file(output, mimetype="image/png", download_name="design.png")
+            response.headers["X-Design-Tune-Metadata"] = json.dumps(metadata, ensure_ascii=True)
+            return response
+        except FileNotFoundError as error:
+            return json_error(str(error), 404)
+        except (ValueError, TypeError, KeyError) as error:
+            return json_error(str(error), 400)
+        except torch.OutOfMemoryError as error:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return json_error(f"CUDA out of memory: {error}", 507)
+        except HTTPException:
+            raise
+        except Exception as error:
+            app.logger.exception("Design Tune design request failed")
             return json_error(f"Inference failed: {error}", 500)
 
     @app.errorhandler(413)
