@@ -66,6 +66,44 @@ class EmbeddingLibrary:
     ) -> torch.Tensor:
         return self.load(f"{layout}/base", device=device, dtype=dtype)
 
+    def trimmed(
+        self,
+        entry_id: str,
+        device: str | torch.device = "cpu",
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        """패딩을 뺀 실제 문장 토큰만 돌려준다 (manifest의 tokens 사용)."""
+        tensor = self.load(entry_id, device=device, dtype=dtype)
+        tokens = self._record(entry_id).get("tokens")
+        return tensor if not tokens else tensor[:, : min(int(tokens), tensor.shape[1])]
+
+    def compose_concat(
+        self,
+        layout: str,
+        values: dict[str, float],
+        device: str | torch.device = "cpu",
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        """공통 서문 + 요청한 control의 지시문을 토큰 축으로 이어 붙인다.
+
+        delta(덧셈)처럼 문장이 밀려 어긋나는 일이 없고, 조합을 미리 등록하지 않아도 된다.
+        순서는 manifest의 control_order(스타일 템플릿에 나오는 순서)를 따른다.
+        """
+        unknown = set(values) - set(self.controls)
+        if unknown:
+            raise ValueError(f"Unknown concat controls: {sorted(unknown)}")
+        order = self.manifest.get("control_order") or list(self.controls)
+        parts = [self.trimmed(f"{layout}/clause/identity", device=device, dtype=dtype)]
+        for attribute in order:
+            if attribute not in values:
+                continue
+            value = float(values[attribute])
+            if value == float(self.controls[attribute]["default"]):
+                continue
+            entry_id = f"{layout}/clause/{attribute}/{format_slider_value(value)}"
+            parts.append(self.trimmed(entry_id, device=device, dtype=dtype))
+        return torch.cat(parts, dim=1)
+
     def interpolate_anchor(
         self,
         layout: str,
@@ -182,7 +220,8 @@ class EmbeddingLibrary:
             shape = tuple(tensor.shape) if isinstance(tensor, torch.Tensor) else type(tensor).__name__
             raise ValueError(f"Embedding {entry_id!r} must have shape (1,L,D), got {shape}")
         expected = self.manifest.get("embedding_shape")
-        if expected is not None and list(tensor.shape) != expected:
+        # clause 엔트리는 잘라서 이어 붙이는 용도라 길이가 고정이 아니다
+        if expected is not None and "/clause/" not in entry_id and list(tensor.shape) != expected:
             raise ValueError(f"Embedding {entry_id!r} shape {list(tensor.shape)} does not match {expected}")
         if not torch.isfinite(tensor).all():
             raise ValueError(f"Embedding {entry_id!r} contains non-finite values")

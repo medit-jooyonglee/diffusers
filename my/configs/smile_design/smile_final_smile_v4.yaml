@@ -1,0 +1,158 @@
+# v4: v3와 control 값·preset·grid는 모두 같고, **문장 구성만** 바꿨다.
+#
+# v3는 바꾸지 않는 control까지 "keep ... exactly as in image 1"을 전부 적어 넣었다.
+# 그래서 (1) 문장이 길고 (2) 조합할 때 같은 말이 중복되며 (3) 요청한 변경과 충돌했다.
+# v4는 **신원 유지만 한 번 말하고, 요청한 control의 지시문만** 넣는다.
+# 기본값 control은 anchor 문구가 빈 문자열이라 그 줄이 통째로 사라진다
+# (render_prompt가 빈 줄을 버린다).
+#
+# 실측(어려운 샘플 + medit, 조합 방식 비교): 같은 조합에서 치아 b*가 낮아지고 신원이 올라갔다.
+version: 1
+template_version: smile-final-smile-v4
+base_template: |-
+  Edit image 1, a photo of this person. {reference_instructions}
+  Keep exactly the same person: face shape, facial proportions, eye shape, nose, skin tone, age, hairstyle, and accessories.
+  {head_yaw}
+  {head_pitch}
+  {smile}
+  {alignment}
+  {tooth_color}
+  Keep the result anatomically plausible and photorealistic.
+layouts:
+  patient_only:
+    roles: [patient]
+    instruction: Apply only the changes listed below.
+  patient_tooth:
+    roles: [patient, tooth]
+    instruction: Apply only the changes listed below. Use image 2 only as a reference for tooth shape, proportions, and arrangement.
+controls:
+  smile:
+    default: 50
+    anchors:
+      "0": Change the facial expression to a relaxed neutral face with the lips closed so that no teeth are visible.
+      "25": Change the facial expression to a gentle closed-mouth smile with the lip corners slightly raised and the lips closed so that no teeth are visible.
+      "50": ""
+      "75": Change the mouth into a smile in which the lower lip rises to completely cover the lower teeth, so that only the row of upper teeth is visible.
+      "100": Change the mouth into a big laughing smile, opening the jaw wider and pulling the lower lip down so that the full row of lower front teeth is exposed below the upper teeth.
+  head_yaw:
+    default: 50
+    anchors:
+      "0": "Head yaw: turn the head clearly to the side so the face points toward the left edge of the image, a three-quarter view."
+      "25": "Head yaw: turn the head slightly so the face points a little toward the left edge of the image."
+      "50": ""
+      "75": "Head yaw: turn the head slightly so the face points a little toward the right edge of the image."
+      "100": "Head yaw: turn the head clearly to the side so the face points toward the right edge of the image, a three-quarter view."
+  head_pitch:
+    default: 50
+    anchors:
+      "0": "Head pitch: tilt the head far down, chin pressed toward the chest, the camera sees the top of the head and the eyes look down."
+      "25": "Head pitch: tilt the head moderately down with the chin lowered."
+      "50": ""
+      "75": "Head pitch: tilt the head moderately up with the chin raised."
+      "100": "Head pitch: tilt the head far back and up, chin raised high, the camera sees under the chin and the eyes look up."
+  tooth_color:
+    default: 0
+    anchors:
+      "0": ""
+      "25": "Tooth color: change only the color of the teeth to a slightly brighter natural shade."
+      "50": "Tooth color: change only the color of the teeth to a natural white shade."
+      "75": "Tooth color: change only the color of the teeth to a bright white shade."
+      "100": "Tooth color: change only the color of the teeth to a very bright cosmetic white shade."
+  alignment:
+    default: 0
+    anchors:
+      "0": ""
+      "25": "Tooth alignment: move only the single most crooked or protruding tooth slightly back toward the dental arch, without reshaping any other tooth."
+      "50": "Tooth alignment: move only the crooked, overlapping, or protruding teeth, such as a snaggletooth, back into line with the neighboring teeth, without reshaping any other tooth."
+      "75": "Tooth alignment: straighten all crooked, overlapping, and protruding teeth into an even dental arch, like after orthodontic treatment."
+      "100": "Tooth alignment: straighten all crooked, overlapping, and protruding teeth into a neat, even, symmetric dental arch, like after complete orthodontic treatment."
+presets:
+  natural: {}
+  smile_closed:
+    smile: 0
+  smile_closed_lip:
+    smile: 25
+  smile_upper:
+    smile: 75
+  smile_full:
+    smile: 100
+  smile_upper_align_whiten:
+    smile: 75
+    alignment: 100
+    tooth_color: 75
+  smile_full_align_whiten:
+    smile: 100
+    alignment: 100
+    tooth_color: 75
+  cmb4_exact:
+    smile: 75
+    alignment: 100
+    tooth_color: 75
+    head_yaw: 75
+  cmb4b_exact:
+    smile: 100
+    alignment: 100
+    tooth_color: 100
+    head_yaw: 25
+  pose_teeth_exact:
+    head_yaw: 75
+    alignment: 100
+    tooth_color: 75
+  yaw25_smile_closed:
+    head_yaw: 25
+    smile: 0
+  yaw25_smile_upper:
+    head_yaw: 25
+    smile: 75
+  yaw25_smile_full:
+    head_yaw: 25
+    smile: 100
+  yaw75_smile_closed:
+    head_yaw: 75
+    smile: 0
+  yaw75_smile_upper:
+    head_yaw: 75
+    smile: 75
+  yaw75_smile_full:
+    head_yaw: 75
+    smile: 100
+  whitening_natural:
+    tooth_color: 50
+  whitening_only:
+    tooth_color: 100
+  align_snaggle:
+    alignment: 50
+  align_only:
+    alignment: 100
+  align_whiten:
+    alignment: 100
+    tooth_color: 75
+  turn_left:
+    head_yaw: 0
+  turn_right:
+    head_yaw: 100
+  look_up:
+    head_pitch: 100
+  look_down:
+    head_pitch: 0
+grids:
+  align_color:
+    attributes: [alignment, tooth_color]
+  yaw_pitch:
+    attributes: [head_yaw, head_pitch]
+mice:
+  global:
+    default: Edit image 1, a photo of this person. {reference_instructions} Keep exactly the same person. Change only what the separate region instructions describe.
+  regions:
+    teeth_white:
+      region: [teeth, inner_mouth]
+      prompt: Make these teeth a clean natural bright white color.
+    teeth_align:
+      region: [mouth]
+      prompt: Straighten the crooked, overlapping, or protruding teeth, such as a snaggletooth, into an even dental arch like after orthodontic treatment.
+    teeth_align_white:
+      region: [mouth]
+      prompt: Straighten the crooked, overlapping, or protruding teeth into an even dental arch like after orthodontic treatment, and make the teeth a natural bright white.
+    teeth_from_template:
+      region: [mouth]
+      prompt: Replace the shape, proportions, size, and arrangement of these teeth with the teeth shown in image 2, keeping a natural bright white color. Ignore the background of image 2.

@@ -12,7 +12,7 @@ import torch
 
 from diffusers import Flux2KleinPipeline, __version__ as diffusers_version
 
-from .prompt_templates import build_prompt_entries, load_experiment_config, reference_roles
+from .prompt_templates import control_order, build_prompt_entries, load_experiment_config, reference_roles
 
 
 DEFAULT_MODEL = "black-forest-labs/FLUX.2-klein-4B"
@@ -98,6 +98,24 @@ def load_encoder_pipeline(args: argparse.Namespace, dtype: torch.dtype) -> Flux2
     return pipeline
 
 
+_TOKENIZER = None
+
+
+def prompt_token_count(prompt: str, args) -> int:
+    """빌드할 때와 같은 chat template으로 실제 토큰 수를 센다 (패딩 제외)."""
+    global _TOKENIZER
+    if _TOKENIZER is None:
+        from transformers import AutoTokenizer
+
+        source = args.text_encoder_model or args.model
+        _TOKENIZER = AutoTokenizer.from_pretrained(Path(source) / "tokenizer")
+    text = _TOKENIZER.apply_chat_template(
+        [{"role": "user", "content": prompt}], tokenize=False,
+        add_generation_prompt=True, enable_thinking=False,
+    )
+    return min(len(_TOKENIZER(text).input_ids), args.max_sequence_length)
+
+
 def main() -> None:
     args = parse_args()
     config, config_hash = load_experiment_config(args.config)
@@ -128,6 +146,7 @@ def main() -> None:
         "embedding_shape": None,
         "negative_embedding": "negative.pt",
         "controls": config["controls"],
+        "control_order": control_order(config),
         "grids": config["grids"],
         "layouts": {name: {"roles": reference_roles(config, name)} for name in config["layouts"]},
         "entries": {},
@@ -154,6 +173,7 @@ def main() -> None:
                 f"Existing embedding library is incompatible in {mismatches}; use a new --output-dir"
             )
         manifest = existing
+    manifest["control_order"] = control_order(config)
 
     pending = []
     for entry in entries:
@@ -163,6 +183,8 @@ def main() -> None:
             raise ValueError(f"Entry prompt changed for {entry.entry_id}; use --overwrite or a new library")
         manifest["entries"][entry.entry_id] = {
             "file": str(relative_path),
+            # 패딩을 뺀 실제 토큰 수. concat 모드가 이 길이로 잘라 이어 붙인다 (추론 시 토크나이저 불필요)
+            "tokens": prompt_token_count(entry.prompt, args),
             "kind": entry.kind,
             "layout": entry.layout,
             "prompt": entry.prompt,

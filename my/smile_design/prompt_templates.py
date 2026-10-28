@@ -75,10 +75,25 @@ def render_prompt(config: dict[str, Any], layout: str, values: dict[str, float])
         name: _anchor_text(config["controls"][name]["anchors"], value)
         for name, value in normalized.items()
     }
-    return config["base_template"].format(
+    rendered = config["base_template"].format(
         reference_instructions=config["layouts"][layout]["instruction"].strip(),
         **descriptions,
-    ).strip()
+    )
+    # 기본값 control의 anchor 문구가 빈 문자열이면 그 줄이 통째로 비므로 빈 줄은 버린다.
+    # (control마다 "원본 그대로 두라"를 쓰지 않고, 바꾸는 항목만 문장에 넣는 스타일용)
+    return "\n".join(line for line in rendered.splitlines() if line.strip()).strip()
+
+
+def control_order(config: dict[str, Any]) -> list[str]:
+    """base_template에 {control}이 나오는 순서. concat으로 이어 붙일 때 이 순서를 쓴다."""
+    template = config["base_template"]
+    positions = []
+    for name in config["controls"]:
+        index = template.find("{" + name + "}")
+        if index >= 0:
+            positions.append((index, name))
+    ordered = [name for _, name in sorted(positions)]
+    return ordered + [name for name in config["controls"] if name not in ordered]
 
 
 def default_values(config: dict[str, Any]) -> dict[str, float]:
@@ -94,7 +109,7 @@ def build_prompt_entries(
     unknown_layouts = set(selected_layouts) - set(config["layouts"])
     if unknown_layouts:
         raise ValueError(f"Unknown reference layouts: {sorted(unknown_layouts)}")
-    all_kinds = {"base", "preset", "anchor", "grid"} | ({"mice"} if "mice" in config else set())
+    all_kinds = {"base", "preset", "anchor", "grid", "clause"} | ({"mice"} if "mice" in config else set())
     selected_kinds = kinds or all_kinds
     unknown_kinds = selected_kinds - all_kinds
     if unknown_kinds:
@@ -133,6 +148,18 @@ def build_prompt_entries(
                     suffix = f"{format_slider_value(first_value)}_{format_slider_value(second_value)}"
                     entry_id = f"{layout}/grid/{grid_name}/{suffix}"
                     entries.append(_entry(config, layout, "grid", entry_id, values, grid=grid_name))
+        if "clause" in selected_kinds:
+            # concat 모드용: 공통 서문 1개 + control 값마다 "그 줄만". 추론할 때 토큰 축으로 이어 붙인다.
+            # 기본값 anchor가 빈 문자열인 스타일(v4 이후)에서만 의미가 있다 — 그때 서문이 control 문장 없이 렌더된다.
+            entries.append(PromptEntry(f"{layout}/clause/identity", "clause", layout,
+                                       render_prompt(config, layout, defaults), {}))
+            for attribute, control in config["controls"].items():
+                for value, text in control["anchors"].items():
+                    if not str(text).strip():
+                        continue
+                    entry_id = f"{layout}/clause/{attribute}/{format_slider_value(value)}"
+                    entries.append(PromptEntry(entry_id, "clause", layout, str(text).strip(),
+                                               {attribute: float(value)}))
         if "mice" in selected_kinds:
             # MICE: 전역 지시문과 영역별 지시문을 각각 독립된 임베딩으로 빌드 (추론 시 이어 붙임)
             instruction = config["layouts"][layout]["instruction"].strip()

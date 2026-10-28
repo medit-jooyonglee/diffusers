@@ -1,0 +1,150 @@
+# v6 = v5 + 두 가지 수정 (28장 실험에서 드러난 문제)
+#  (a) 'Do not add, remove, enlarge, or reshape any tooth beyond the requested change.' 고정 줄 복원.
+#      v5에서 이 줄을 빼자 미백 단독(50 이상)에서도 치열이 통째로 새로 그려졌다 (sample27, teeth01 등).
+#      'beyond the requested change'가 범위를 스스로 한정하므로 restoration 지시와 충돌하지 않는다.
+#  (b) restoration 문구에서 색 지시('natural white tooth enamel')를 뺐다. 색은 tooth_color만 담당한다.
+#      v5에서는 align_restore(색 0)인데도 b*가 10.8 -> 5.2로 떨어져 정렬 단독에 미백이 섞였다.
+#
+# v5: 수식 조합(delta/보간)을 버리고 **선별한 스타일 목록**으로 간다.
+#
+# v4에서 바뀐 것
+#  1. control `restoration` 추가 — 결손 메우기 / 금속·보철 제거.
+#     실측(sample17: 금속 보철 + 앞니 결손)에서 "straighten" 문구만으로는 검은 틈이 끝까지 남았고,
+#     "없는 이를 만들어라"를 직접 써도 소용없었다. 템플릿 이미지를 함께 넣어야 메워진다.
+#     그래서 restoration 문구는 템플릿(patient_tooth)과 같이 쓰는 것을 전제로 한다.
+#  2. preset을 용도별로 5개씩 묶었다 — 미백 단독 5 / 정렬 단독 5 / 통합 5 / 고개·웃음.
+#     앱은 이 이름만 고르면 되고 가중치·조합을 몰라도 된다.
+#  3. v4와 마찬가지로 바꾸지 않는 control은 문장에 아예 넣지 않는다 (신원 유지만 한 번 말한다).
+version: 1
+template_version: smile-final-smile-v6
+base_template: |-
+  Edit image 1, a photo of this person. {reference_instructions}
+  Keep exactly the same person: face shape, facial proportions, eye shape, nose, skin tone, age, hairstyle, and accessories.
+  {head_yaw}
+  {head_pitch}
+  {smile}
+  {alignment}
+  {restoration}
+  {tooth_color}
+  Do not add, remove, enlarge, or reshape any tooth beyond the requested change.
+  Keep the result anatomically plausible and photorealistic.
+layouts:
+  patient_only:
+    roles: [patient]
+    instruction: Apply only the changes listed below.
+  patient_tooth:
+    roles: [patient, tooth]
+    instruction: Apply only the changes listed below. Use image 2 only as a reference for tooth shape, proportions, and arrangement.
+controls:
+  smile:
+    default: 50
+    anchors:
+      "0": Change the facial expression to a relaxed neutral face with the lips closed so that no teeth are visible.
+      "25": Change the facial expression to a gentle closed-mouth smile with the lip corners slightly raised and the lips closed so that no teeth are visible.
+      "50": ""
+      "75": Change the mouth into a smile in which the lower lip rises to completely cover the lower teeth, so that only the row of upper teeth is visible.
+      "100": Change the mouth into a big laughing smile, opening the jaw wider and pulling the lower lip down so that the full row of lower front teeth is exposed below the upper teeth.
+  head_yaw:
+    default: 50
+    anchors:
+      "0": "Head yaw: turn the head clearly to the side so the face points toward the left edge of the image, a three-quarter view."
+      "25": "Head yaw: turn the head slightly so the face points a little toward the left edge of the image."
+      "50": ""
+      "75": "Head yaw: turn the head slightly so the face points a little toward the right edge of the image."
+      "100": "Head yaw: turn the head clearly to the side so the face points toward the right edge of the image, a three-quarter view."
+  head_pitch:
+    default: 50
+    anchors:
+      "0": "Head pitch: tilt the head far down, chin pressed toward the chest, the camera sees the top of the head and the eyes look down."
+      "25": "Head pitch: tilt the head moderately down with the chin lowered."
+      "50": ""
+      "75": "Head pitch: tilt the head moderately up with the chin raised."
+      "100": "Head pitch: tilt the head far back and up, chin raised high, the camera sees under the chin and the eyes look up."
+  tooth_color:
+    default: 0
+    anchors:
+      "0": ""
+      "25": "Tooth color: change only the color of the teeth to a slightly brighter natural shade."
+      "50": "Tooth color: change only the color of the teeth to a natural white shade."
+      "75": "Tooth color: change only the color of the teeth to a bright white shade."
+      "100": "Tooth color: change only the color of the teeth to a very bright cosmetic white shade."
+  alignment:
+    default: 0
+    anchors:
+      "0": ""
+      "25": "Tooth alignment: move only the single most crooked or protruding tooth slightly back toward the dental arch, without reshaping any other tooth."
+      "50": "Tooth alignment: move only the crooked, overlapping, or protruding teeth, such as a snaggletooth, back into line with the neighboring teeth, without reshaping any other tooth."
+      "75": "Tooth alignment: straighten all crooked, overlapping, and protruding teeth into an even dental arch, like after orthodontic treatment."
+      "100": "Tooth alignment: straighten all crooked, overlapping, and protruding teeth into a neat, even, symmetric dental arch, like after complete orthodontic treatment."
+  # 결손·금속은 정렬 문구로 해결되지 않는다. 치아 템플릿과 함께 쓸 때 효과가 난다.
+  restoration:
+    default: 0
+    anchors:
+      "0": ""
+      "50": "Replace every missing tooth: fill each dark gap in the dental arch with a new tooth of natural size and shape that matches the neighboring teeth, so no gap remains."
+      "75": "Replace all metal crowns, silver fillings and dark restorations with natural tooth enamel of the same shade as the neighboring teeth, so no metal is visible anywhere."
+      "100": "Rebuild a complete dental arch: replace every missing tooth so no dark gap remains, and replace all metal crowns and dark restorations with natural tooth enamel of the same shade as the neighboring teeth."
+presets:
+  natural: {}
+
+  # --- 미백 단독 5 ---------------------------------------------------------
+  whiten_soft:        {tooth_color: 25}
+  whiten_natural:     {tooth_color: 50}
+  whiten_bright:      {tooth_color: 75}
+  whiten_max:         {tooth_color: 100}
+  whiten_demetal:     {tooth_color: 75, restoration: 75}
+
+  # --- 정렬 단독 5 ---------------------------------------------------------
+  align_snaggle:      {alignment: 50}
+  align_light:        {alignment: 75}
+  align_full:         {alignment: 100}
+  align_gap:          {alignment: 100, restoration: 50}
+  align_restore:      {alignment: 100, restoration: 100}
+
+  # --- 통합(치아) 5 --------------------------------------------------------
+  teeth_natural:      {alignment: 75,  tooth_color: 50}
+  teeth_basic:        {alignment: 100, tooth_color: 75}
+  teeth_max:          {alignment: 100, tooth_color: 100}
+  teeth_restore:      {alignment: 100, tooth_color: 75,  restoration: 100}
+  teeth_restore_max:  {alignment: 100, tooth_color: 100, restoration: 100}
+
+  # --- 고개 / 웃음 ---------------------------------------------------------
+  turn_left:          {head_yaw: 0}
+  turn_left_soft:     {head_yaw: 25}
+  turn_right_soft:    {head_yaw: 75}
+  turn_right:         {head_yaw: 100}
+  look_up:            {head_pitch: 100}
+  look_down:          {head_pitch: 0}
+  smile_closed:       {smile: 0}
+  smile_closed_lip:   {smile: 25}
+  smile_upper:        {smile: 75}
+  smile_full:         {smile: 100}
+
+  # --- 고개 + 웃음 조합 (따로 돌리면 뒤 단계가 앞을 되돌린다) ---------------
+  yaw25_smile_closed: {head_yaw: 25, smile: 0}
+  yaw25_smile_upper:  {head_yaw: 25, smile: 75}
+  yaw25_smile_full:   {head_yaw: 25, smile: 100}
+  yaw75_smile_closed: {head_yaw: 75, smile: 0}
+  yaw75_smile_upper:  {head_yaw: 75, smile: 75}
+  yaw75_smile_full:   {head_yaw: 75, smile: 100}
+grids:
+  align_color:
+    attributes: [alignment, tooth_color]
+  yaw_pitch:
+    attributes: [head_yaw, head_pitch]
+mice:
+  global:
+    default: Edit image 1, a photo of this person. {reference_instructions} Keep exactly the same person. Change only what the separate region instructions describe.
+  regions:
+    teeth_white:
+      region: [teeth, inner_mouth]
+      prompt: Make these teeth a clean natural bright white color.
+    teeth_align:
+      region: [mouth]
+      prompt: Straighten the crooked, overlapping, or protruding teeth, such as a snaggletooth, into an even dental arch like after orthodontic treatment.
+    teeth_restore:
+      region: [mouth]
+      prompt: "Rebuild a complete dental arch: replace every missing tooth so no dark gap remains, replace all metal crowns with natural white enamel, and straighten the teeth into an even arch."
+    teeth_from_template:
+      region: [mouth]
+      prompt: Replace the shape, proportions, size, and arrangement of these teeth with the teeth shown in image 2, keeping a natural bright white color. Ignore the background of image 2.

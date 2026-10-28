@@ -855,6 +855,12 @@ class InferenceEngine:
             return library.interpolate_grid(
                 layout, grid, normalized_values, self.args.device, self.dtype
             ), {"mode": mode, "grid": grid, "values": normalized_values}
+        if mode == "concat":
+            # 공통 서문 + 요청한 control 지시문을 토큰 축으로 이어 붙인다 (덧셈이 아니라 나열).
+            # 조합을 미리 등록할 필요가 없고, delta처럼 문장이 밀려 어긋나지 않는다.
+            return library.compose_concat(
+                layout, normalized_values, self.args.device, self.dtype
+            ), {"mode": mode, "values": normalized_values}
         if mode == "delta":
             strengths = parameters.get("delta_strengths", {})
             if not isinstance(strengths, dict):
@@ -899,7 +905,8 @@ def parse_parameters() -> dict[str, Any]:
 
 
 # /api/v1/design 전용 상수. 근거는 docs/smile_tune/tunning_guide.md 1장.
-TEETH_CONTROLS = ("tooth_color", "alignment")
+# 입 안쪽만 inpaint로 고치는 control. restoration(결손/금속 복원)도 여기 속한다.
+TEETH_CONTROLS = ("tooth_color", "alignment", "restoration")
 POSE_CONTROLS = ("head_yaw", "head_pitch")
 TEETH_MASK = {"mode": "inpaint", "regions": ["inner_mouth"], "dilate": 8, "feather": 6}
 # 얼굴 폭² 대비 ×1000. 실측에서 다문 입은 inner_mouth 1.6 / teeth 0.1, 벌린 입은 17.5 / 6.9 이상이었다
@@ -942,13 +949,21 @@ def exact_preset_finder(library: EmbeddingLibrary, layout: str):
 
 
 def _stage_parameters(
-    config: dict[str, Any], values: dict[str, float], grid: str | None, find_preset=None
+    config: dict[str, Any], values: dict[str, float], grid: str | None, find_preset=None,
+    has_clauses: bool = False,
 ) -> dict[str, Any]:
-    """조합 문장 preset → grid → anchor 순으로 고른다. delta(덧셈)는 조합이 깨지므로 쓰지 않는다."""
+    """조합 문장 preset이 있으면 그것, 없으면 concat.
+
+    concat = 공통 서문 + 요청한 control 지시문을 이어 붙인다. 조합을 미리 등록하지 않아도 되고,
+    실측에서 preset과 대등했다 (delta는 효과가 절반 이하라 쓰지 않는다).
+    clause 엔트리가 없는 구버전 라이브러리는 grid → anchor로 물러난다.
+    """
     if find_preset is not None:
         preset = find_preset(default_values(config) | values)
         if preset:
             return {"mode": "preset", "preset": preset}
+    if has_clauses:
+        return {"mode": "concat", "control_values": dict(values)}
     if len(values) == 1:
         attribute, value = next(iter(values.items()))
         return {"mode": "anchor", "attribute": attribute, "control_values": {attribute: value}}
@@ -958,7 +973,8 @@ def _stage_parameters(
 
 
 def plan_design_stages(
-    config: dict[str, Any], requested: dict[str, float], closed_mouth: bool, find_preset=None
+    config: dict[str, Any], requested: dict[str, float], closed_mouth: bool, find_preset=None,
+    has_clauses: bool = False,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """요청값을 '치아 inpaint' → '마스크 없는 큰 변화' 순서의 단계로 나눈다.
 
@@ -974,22 +990,38 @@ def plan_design_stages(
     smile = {k: v for k, v in changed.items() if k == "smile"}
     stages: list[dict[str, Any]] = []
     warnings: list[str] = []
+    ignored = sorted(set(changed) - set(TEETH_CONTROLS) - set(POSE_CONTROLS) - {"smile"})
+    if ignored:
+        warnings.append(f"These controls are not handled by this endpoint and were ignored: {ignored}")
 
+    # 다문 입에 치아를 먼저 걸면 닫힌 입술 안에 치아가 삽입된다 → 입을 벌리는 단계가 치아보다 앞에 와야 한다.
+    # 요청에 웃음이 없으면 자동으로 넣고, 이미 입을 벌리는 웃음을 요청했으면 그 단계를 앞으로 보낸다.
     opening_mouth = False
-    if closed_mouth and teeth and not smile and "smile" in config["controls"]:
-        # 다문 입에 치아만 걸면 닫힌 입술 안에 치아가 삽입된다 → 이때만 입을 먼저 벌린다
-        smile = {"smile": CLOSED_MOUTH_SMILE}
-        opening_mouth = True
-        warnings.append(
-            f"Mouth is closed; opening it with smile={CLOSED_MOUTH_SMILE:g} first. "
-            "Identity similarity drops markedly, so present the result as a simulation."
-        )
+    if closed_mouth and teeth and "smile" in config["controls"]:
+        if not smile:
+            smile = {"smile": CLOSED_MOUTH_SMILE}
+            opening_mouth = True
+            warnings.append(
+                f"Mouth is closed; opening it with smile={CLOSED_MOUTH_SMILE:g} first. "
+                "Identity similarity drops markedly, so present the result as a simulation."
+            )
+        elif smile["smile"] >= CLOSED_MOUTH_SMILE:
+            opening_mouth = True
+            warnings.append(
+                "Mouth is closed, so the requested smile runs before the tooth edit. "
+                "Identity similarity drops markedly, so present the result as a simulation."
+            )
+        else:
+            warnings.append(
+                f"Mouth is closed and the requested smile={smile['smile']:g} does not open it, "
+                "so the tooth edit has almost no room to work."
+            )
 
     # 고개와 웃음을 따로 돌리면 뒤 단계가 앞 단계를 되돌린다 (실측: 웃음 0.94 → 0.17).
     # 두 축을 한 문장으로 인코딩한 조합 preset이 있으면 한 단계로 합친다.
     big: list[dict[str, Any]] = []
     if pose and smile:
-        merged = _stage_parameters(config, {**pose, **smile}, None, find_preset)
+        merged = _stage_parameters(config, {**pose, **smile}, None, find_preset, has_clauses)
         if merged.get("mode") == "preset":
             big.append({"stage": "pose_smile", **merged, "mask": False})
             pose, smile = {}, {}
@@ -1001,14 +1033,14 @@ def plan_design_stages(
     for name, values, grid in (("pose", pose, "yaw_pitch"), ("smile", smile, None)):
         if not values:
             continue
-        stage = _stage_parameters(config, values, grid, find_preset)
+        stage = _stage_parameters(config, values, grid, find_preset, has_clauses)
         if not stage:
             raise ValueError(f"No exact embedding for {name} {sorted(values)}; add a combination preset")
         big.append({"stage": name, **stage, "mask": False})
 
     teeth_stage = None
     if teeth:
-        stage = _stage_parameters(config, teeth, "align_color", find_preset)
+        stage = _stage_parameters(config, teeth, "align_color", find_preset, has_clauses)
         if not stage:
             raise ValueError(f"No exact embedding for teeth {sorted(teeth)}; add a combination preset")
         teeth_stage = {"stage": "teeth", **stage, "mask": dict(TEETH_MASK)}
@@ -1263,7 +1295,8 @@ def create_app(args: argparse.Namespace | None = None) -> Flask:
             if not bool(parameters.get("open_closed_mouth", True)):
                 closed = False
             find_preset = exact_preset_finder(library, "patient_only")
-            stages, warnings = plan_design_stages(config, requested, closed, find_preset)
+            has_clauses = any(k.startswith("patient_only/clause/") for k in library.entries)
+            stages, warnings = plan_design_stages(config, requested, closed, find_preset, has_clauses)
 
             seed = int(parameters.get("seed", 0))
             common = {"style_name": parameters["style_name"], "seed": seed}
