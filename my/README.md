@@ -519,3 +519,42 @@ nohup env \
 TORCHINDUCTOR_CACHE_DIR=$PWD/outputs/inductor_cache TRITON_CACHE_DIR=$PWD/outputs/inductor_cache/triton nohup python my/flux2_klein_t2i_edit_dataset.py --num-images 17000 --output-dir /data1/jooyonglee/public/flux2_klein4b_t2i_edit_17k_2 --seed 0 --fp8-compute --compile regional > logs/klein_t2i_edit_17k.log 2>&1
 
 
+
+
+# 통합 서버 구동
+
+두 서버(design_tune_server:5000, backend_server:8000)를 같이 띄운다. PID를 파일로 남겨둬야
+nohup으로 백그라운드에 놓인 뒤에도 깔끔하게 둘 다 종료할 수 있다.
+
+~~~bash
+nohup python my/unified_server.py --flux-port 8605 --wan-port 8606 \
+  --wan-repo /workspace/repo/iSmileNet \
+  --wan-extra-args "--models wan --transformer_dir .../Wan2.2-TI2V-5B-Turbo" > logs/uni_server.log 2>&1 &
+echo $! > logs/uni_server.pid
+~~~
+
+## 종료
+
+`unified_server.py`(런처) 프로세스에 SIGTERM을 보내면 design_tune_server / backend_server 둘 다
+같이 정리되어 종료된다 (`unified_server.py`의 시그널 핸들러가 두 자식 프로세스에 terminate ->
+15초 대기 -> 안 죽으면 kill 순서로 처리).
+
+~~~bash
+kill "$(cat logs/uni_server.pid)"
+~~~
+
+PID 파일을 안 남겼거나 잃어버렸으면:
+
+~~~bash
+pkill -f "my/unified_server.py"
+# 혹시 자식이 안 죽고 남아 있으면 (런처가 먼저 죽은 경우 등) 직접 정리
+pkill -f "my/design_tune_server.py"
+pkill -f "backend_server\.\.py"
+~~~
+
+종료 후 GPU가 실제로 비워졌는지 확인:
+
+~~~bash
+nvidia-smi --query-gpu=memory.used,memory.total --format=csv
+~~~
+

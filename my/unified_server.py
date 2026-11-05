@@ -87,6 +87,10 @@ def main() -> None:
     parser.add_argument("--log-dir", type=Path, default=ROOT / "outputs" / "unified_server_logs")
     args = parser.parse_args()
 
+    # nohup redirects stdout to a file, which switches Python to block-buffering; force line-buffering
+    # so these print()s actually show up in the log before the process exits.
+    sys.stdout.reconfigure(line_buffering=True)
+
     args.log_dir.mkdir(parents=True, exist_ok=True)
     flux_log = open(args.log_dir / "design_tune_server.log", "w")
     wan_log = open(args.log_dir / "backend_server.log", "w")
