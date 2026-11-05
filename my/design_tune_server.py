@@ -27,6 +27,7 @@ from PIL import Image, ImageFilter, ImageOps, PngImagePlugin
 
 from diffusers import Flux2KleinInpaintPipeline, Flux2KleinPipeline
 
+from gpu_sequential_lock import gpu_sequential_guard, set_enabled as set_gpu_sequential
 from smile_design.embedding_library import EmbeddingLibrary
 from smile_design.face_mask import FACE_OVAL, MASK_REGIONS, FaceMasker, parse_regions
 from smile_design.mice import MiceAttention, MiceEdit, PromptLengthCounter
@@ -645,7 +646,7 @@ class InferenceEngine:
                 "num_images_per_prompt": 1,
                 "generator": generator,
             }
-        with self.lock, torch.inference_mode():
+        with gpu_sequential_guard(), self.lock, torch.inference_mode():
             hook = mice.install(pipeline.transformer) if mice else None
             try:
                 generated = pipeline(**call_kwargs).images[0]
@@ -716,7 +717,7 @@ class InferenceEngine:
             app_logger.warning(f"[design_tune] {step_warning}")
         masks, _ = self.masker.region_masks(patient)
         current, union, edit_metadata = patient, None, []
-        with self.lock, torch.inference_mode():
+        with gpu_sequential_guard(), self.lock, torch.inference_mode():
             for index, edit in enumerate(mask_options["edits"]):
                 name = str(edit["prompt"])
                 if name not in regions_config:
@@ -1081,6 +1082,8 @@ def load_uploaded_images(max_images: int) -> list[Image.Image]:
 
 def create_app(args: argparse.Namespace | None = None) -> Flask:
     args = args or parse_args([])
+    if args.serialize_gpu:
+        set_gpu_sequential(True)
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = args.max_request_megabytes * 1024 * 1024
     store = StyleStore(args.styles_dir, args.libraries_dir)
@@ -1403,6 +1406,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--build-timeout", type=parse_positive_int, default=7200)
     parser.add_argument("--job-log-characters", type=parse_positive_int, default=20000)
     parser.add_argument("--cpu-offload", action="store_true")
+    parser.add_argument(
+        "--serialize-gpu",
+        action="store_true",
+        help="Cross-process GPU lock (see gpu_sequential_lock.py): if another process using the same "
+        "lock (e.g. the img2vid backend_server started via unified_server.py) is mid-generation, wait "
+        "for it instead of running concurrently. Off by default; each server only serializes its own requests.",
+    )
     parser.add_argument(
         "--fp8-weights",
         action=argparse.BooleanOptionalAction,

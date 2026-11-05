@@ -1,0 +1,139 @@
+# v9 = v8 + "5단계가 눈에 띄게 다르다" 요청에 대한 강화판
+#  - 배경: v8의 tooth_color/alignment 5단계는 치과적으로는 올바른 순서(VITA A2→A1→B1, 1개 치아→전체 교정)지만
+#    단계 사이 문구 차이가 작아서(예: "healthy natural" vs "clean bright") 실제 생성 결과에서 단계 간 변화폭이
+#    작게 느껴진다는 평가. 또한 템플릿(image 2, patient_tooth)을 같이 쓰면 색/정렬 지시가 템플릿 쪽으로 희석된다는
+#    관찰(v8 주석, round3/4 색 희석 경험)이 있었는데 v8은 색 희석만 보정했고 정렬 희석은 보정하지 않았다.
+#  - 이번 버전에서 바꾼 것:
+#    1) tooth_color/alignment 앵커 문구에 "이전 단계보다 명백히/뚜렷이 더 ~하다"는 명시적 비교급 표현을 넣어
+#       모델이 단계마다 더 큰 변화폭을 만들도록 유도한다 (자연스러움 가드는 유지 — chalky/flat/matte 금지 문구 보존).
+#    2) patient_tooth 레이아웃 지시문에 색뿐 아니라 "정렬 정도도 템플릿과 무관하게 아래 지시를 그대로 따르라"는
+#       희석 방지 문구를 추가한다 (round9~14 dental 실험에서 색 희석 보정에 쓴 것과 같은 레버를 정렬에도 적용).
+#  - controls/presets 구조, base_template, restoration/smile/head_yaw/head_pitch는 v8과 동일 (그대로 재사용).
+version: 1
+template_version: smile-final-smile-v9
+base_template: |-
+  Edit image 1, a photo of this person. {reference_instructions}
+  Keep exactly the same person: face shape, facial proportions, eye shape, nose, skin tone, age, hairstyle, and accessories.
+  {head_yaw}
+  {head_pitch}
+  {smile}
+  {alignment}
+  {restoration}
+  {tooth_color}
+  Do not add, remove, enlarge, or reshape any tooth beyond the requested change.
+  Keep the result anatomically plausible and photorealistic.
+layouts:
+  patient_only:
+    roles: [patient]
+    instruction: Apply only the changes listed below.
+  patient_tooth:
+    roles: [patient, tooth]
+    instruction: >-
+      Apply only the changes listed below. Use image 2 only as a loose reference for tooth shape,
+      proportions, and arrangement — do not copy its color, lighting, or material. The tooth color and
+      tooth alignment instructions below are mandatory and independent of image 2: achieve the exact
+      brightness described in the tooth color instruction and the exact degree of straightening described
+      in the tooth alignment instruction, even if image 2's teeth look different in color, shape, or
+      alignment from that target.
+controls:
+  smile:
+    default: 50
+    anchors:
+      "0": Change the facial expression to a relaxed neutral face with the lips closed so that no teeth are visible.
+      "25": Change the facial expression to a gentle closed-mouth smile with the lip corners slightly raised and the lips closed so that no teeth are visible.
+      "50": ""
+      "75": Change the mouth into a smile in which the lower lip rises to completely cover the lower teeth, so that only the row of upper teeth is visible.
+      "100": Change the mouth into a big laughing smile, opening the jaw wider and pulling the lower lip down so that the full row of lower front teeth is exposed below the upper teeth.
+  head_yaw:
+    default: 50
+    anchors:
+      "0": "Head yaw: turn the head clearly to the side so the face points toward the left edge of the image, a three-quarter view."
+      "25": "Head yaw: turn the head slightly so the face points a little toward the left edge of the image."
+      "50": ""
+      "75": "Head yaw: turn the head slightly so the face points a little toward the right edge of the image."
+      "100": "Head yaw: turn the head clearly to the side so the face points toward the right edge of the image, a three-quarter view."
+  head_pitch:
+    default: 50
+    anchors:
+      "0": "Head pitch: tilt the head far down, chin pressed toward the chest, the camera sees the top of the head and the eyes look down."
+      "25": "Head pitch: tilt the head moderately down with the chin lowered."
+      "50": ""
+      "75": "Head pitch: tilt the head moderately up with the chin raised."
+      "100": "Head pitch: tilt the head far back and up, chin raised high, the camera sees under the chin and the eyes look up."
+  # v9: 단계마다 "이전 단계보다 명백히 더 밝다"는 비교급을 명시해 단계 간 체감 변화폭을 키운다.
+  # v9.1: 광택(specular highlight) 지시를 문장 끝에 묻힌 종속절이 아니라, 밝기 지시와 분리된 별도
+  # 문장으로 매번 강조한다 -- "dramatically/obviously whiter" 같은 강한 비교급이 광택 지시보다
+  # 우선순위가 높아져 결과가 납작한(flat/plastic) 흰색으로 나오는 것을 막기 위함(사용자 피드백).
+  tooth_color:
+    default: 0
+    anchors:
+      "0": ""
+      "25": "Tooth color: do a light whitening pass — remove the surface stains and yellow discoloration, brightening the enamel noticeably above its original color, while keeping a warm natural ivory tone, the natural enamel texture, and translucent incisal edges. Whatever the brightness, the enamel surface must keep a glossy, wet-looking, light-reflecting finish with natural specular highlights, never flat or matte."
+      "50": "Tooth color: do a moderate whitening pass — lighten the teeth to a healthy bright shade around VITA A2, clearly and visibly brighter than a light stain-removal pass, keeping a warm-to-neutral tone, the natural enamel texture, and translucent incisal edges, not pure white or flat matte white. Whatever the brightness, the enamel surface must keep a glossy, wet-looking, light-reflecting finish with natural specular highlights, never flat or matte."
+      "75": "Tooth color: do a strong whitening pass — lighten the teeth to a bright cosmetic shade around VITA A1, unmistakably whiter than the moderate pass above, keeping only a faint warm undertone, the enamel texture, and translucent incisal edges, not flat, chalky, matte, or pure white. Whatever the brightness, the enamel surface must keep a glossy, wet-looking, light-reflecting finish with clearly visible natural specular highlights near the center of each tooth, never flat or matte."
+      "100": "Tooth color: do a maximum whitening pass — lighten the teeth to the brightest cosmetic white shade used in premium smile makeovers, around VITA B1 or brighter, dramatically and obviously whiter than the strong pass above, while still preserving the enamel texture and translucent incisal edges, not chalky, grey, matte, or like plastic. However bright the teeth become, the enamel surface must keep a glossy, wet-looking, light-reflecting finish with clearly visible natural specular highlights near the center of each tooth — the brighter the shade, the more important this gloss is to avoid a flat, painted, plastic look."
+  # v9: 단계마다 교정 범위(치아 개수)와 "이전 단계보다 명백히 더 가지런하다"는 비교급을 명시한다.
+  alignment:
+    default: 0
+    anchors:
+      "0": ""
+      "25": "Tooth alignment: do a minimal correction — move only the single most crooked, rotated, or protruding tooth back toward the dental arch by a small, clearly visible amount, without reshaping or moving any other tooth."
+      "50": "Tooth alignment: do a partial correction — move all crooked, rotated, overlapping, or protruding teeth, such as a snaggletooth, back into line with their neighbors, visibly and noticeably straighter than a single-tooth correction, without reshaping any tooth's size or shape."
+      "75": "Tooth alignment: do a strong correction — straighten nearly all crooked, overlapping, and protruding teeth into an even dental arch, closing most of the visible gaps and overlaps, unmistakably straighter than a partial correction, as if midway through orthodontic treatment."
+      "100": "Tooth alignment: do a complete correction — straighten every crooked, overlapping, and protruding tooth into a neat, perfectly even, symmetric dental arch with no rotations or overlaps remaining, dramatically and obviously straighter than any of the previous levels, as if after full orthodontic treatment."
+  restoration:
+    default: 0
+    anchors:
+      "0": ""
+      "50": "Replace every missing tooth: fill each dark gap in the dental arch with a new tooth of natural size and shape that matches the neighboring teeth, so no gap remains."
+      "75": "Replace all metal crowns, silver fillings and dark restorations with natural tooth enamel of the same shade as the neighboring teeth, so no metal is visible anywhere."
+      "100": "Rebuild a complete dental arch: replace every missing tooth so no dark gap remains, and replace all metal crowns and dark restorations with natural tooth enamel of the same shade as the neighboring teeth."
+presets:
+  natural: {}
+
+  # --- 미백 단독 5 ---------------------------------------------------------
+  whiten_destain:     {tooth_color: 25}
+  whiten_natural:     {tooth_color: 50}
+  whiten_bright:      {tooth_color: 75}
+  whiten_cosmetic:    {tooth_color: 100}
+  whiten_demetal:     {tooth_color: 75, restoration: 75}
+
+  # --- 정렬 단독 5 ---------------------------------------------------------
+  align_snaggle:      {alignment: 50}
+  align_light:        {alignment: 75}
+  align_full:         {alignment: 100}
+  align_gap:          {alignment: 100, restoration: 50}
+  align_restore:      {alignment: 100, restoration: 100}
+
+  # --- 통합(정렬 + 미백) 조합옵션 -------------------------------------------
+  teeth_destain:      {alignment: 100, tooth_color: 25}
+  teeth_natural:      {alignment: 100, tooth_color: 50}
+  teeth_basic:        {alignment: 100, tooth_color: 75}
+  teeth_cosmetic:     {alignment: 100, tooth_color: 100}
+  teeth_soft:         {alignment: 75,  tooth_color: 50}
+  teeth_restore:      {alignment: 100, tooth_color: 75,  restoration: 100}
+  teeth_restore_max:  {alignment: 100, tooth_color: 100, restoration: 100}
+
+  # --- 고개 / 웃음 ---------------------------------------------------------
+  turn_left:          {head_yaw: 0}
+  turn_left_soft:     {head_yaw: 25}
+  turn_right_soft:    {head_yaw: 75}
+  turn_right:         {head_yaw: 100}
+  look_up:            {head_pitch: 100}
+  look_down:          {head_pitch: 0}
+  smile_closed:       {smile: 0}
+  smile_closed_lip:   {smile: 25}
+  smile_upper:        {smile: 75}
+  smile_full:         {smile: 100}
+
+  yaw25_smile_closed: {head_yaw: 25, smile: 0}
+  yaw25_smile_upper:  {head_yaw: 25, smile: 75}
+  yaw25_smile_full:   {head_yaw: 25, smile: 100}
+  yaw75_smile_closed: {head_yaw: 75, smile: 0}
+  yaw75_smile_upper:  {head_yaw: 75, smile: 75}
+  yaw75_smile_full:   {head_yaw: 75, smile: 100}
+grids:
+  align_color:
+    attributes: [alignment, tooth_color]
+  yaw_pitch:
+    attributes: [head_yaw, head_pitch]

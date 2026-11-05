@@ -195,3 +195,7 @@ wandb
 *.pt
 *.bin
 *.safetensors
+*.jsonl
+outputs/**
+outputs/**
+/outputs/

@@ -1,0 +1,172 @@
+# v8 = v7 + tooth_color에 광택(specular highlight) 지시 추가
+#  - 배경: v7까지는 미백이 "밝다/희다"만 지시해서 결과가 플랫한 무광(matte) 흰색으로 나와 cartoon 느낌이 난다는 평가.
+#  - outputs/dental_gloss_test/report.md 실험(샘플 4장, patient_only 평이 생성 + inpaint 두 경로 모두 확인):
+#    tooth_color 50/75/100에 "glossy, light-reflecting enamel surface with natural specular highlights"를
+#    추가하면 teeth03/teeth04에서 치아에 뚜렷한 하이라이트(반사광)가 생겨 또렷이 덜 납작해 보였다.
+#    sample17/yellowteeth에서는 차이가 미미했지만 더 나빠진 경우는 없었다 — 순부작용 없는 개선으로 채택.
+#  - 같은 실험에서 patient_tooth 레이아웃(image 2 = 치아 템플릿 참조, dentals/image2.png 대 teeeth1.png 비교)은
+#    plain 생성·inpaint(image_reference) 두 경로 모두 결과에 뚜렷한 차이를 만들지 못했다. 현재 문구
+#    ("Use image 2 only as a reference for tooth shape...")로는 템플릿 치아 모양이 실제로 전이되지 않는다 —
+#    "템플릿 적용이 극적이지 않다"는 평가가 맞다. 모양을 템플릿에 강하게 맞추려면 프롬프트 문구만으로는
+#    부족하고 별도 메커니즘(예: IP-Adapter류 조건화)이 필요해 보인다. 이 버전에서는 그 문제를 건드리지 않았다.
+#
+# v7 = v6 + 미백 문구 교체 (결과가 '가짜처럼 하얗다'는 평가)
+#  - tooth_color 문구를 VITA 색조 기준으로 바꾸고 순백/분필 느낌을 금지했다.
+#  - 미백 스타일을 destain / natural(A2) / bright(A1) / cosmetic(B1)로 다시 묶었다.
+#  - 통합 스타일도 같은 4단계로 맞췄다 (teeth_destain / natural / basic / cosmetic).
+#
+# v6 = v5 + 두 가지 수정 (28장 실험에서 드러난 문제)
+#  (a) 'Do not add, remove, enlarge, or reshape any tooth beyond the requested change.' 고정 줄 복원.
+#      v5에서 이 줄을 빼자 미백 단독(50 이상)에서도 치열이 통째로 새로 그려졌다 (sample27, teeth01 등).
+#      'beyond the requested change'가 범위를 스스로 한정하므로 restoration 지시와 충돌하지 않는다.
+#  (b) restoration 문구에서 색 지시('natural white tooth enamel')를 뺐다. 색은 tooth_color만 담당한다.
+#      v5에서는 align_restore(색 0)인데도 b*가 10.8 -> 5.2로 떨어져 정렬 단독에 미백이 섞였다.
+#
+# v5: 수식 조합(delta/보간)을 버리고 **선별한 스타일 목록**으로 간다.
+#
+# v4에서 바뀐 것
+#  1. control `restoration` 추가 — 결손 메우기 / 금속·보철 제거.
+#     실측(sample17: 금속 보철 + 앞니 결손)에서 "straighten" 문구만으로는 검은 틈이 끝까지 남았고,
+#     "없는 이를 만들어라"를 직접 써도 소용없었다. 템플릿 이미지를 함께 넣어야 메워진다.
+#     그래서 restoration 문구는 템플릿(patient_tooth)과 같이 쓰는 것을 전제로 한다.
+#  2. preset을 용도별로 5개씩 묶었다 — 미백 단독 5 / 정렬 단독 5 / 통합 5 / 고개·웃음.
+#     앱은 이 이름만 고르면 되고 가중치·조합을 몰라도 된다.
+#  3. v4와 마찬가지로 바꾸지 않는 control은 문장에 아예 넣지 않는다 (신원 유지만 한 번 말한다).
+version: 1
+template_version: smile-final-smile-v8
+base_template: |-
+  Edit image 1, a photo of this person. {reference_instructions}
+  Keep exactly the same person: face shape, facial proportions, eye shape, nose, skin tone, age, hairstyle, and accessories.
+  {head_yaw}
+  {head_pitch}
+  {smile}
+  {alignment}
+  {restoration}
+  {tooth_color}
+  Do not add, remove, enlarge, or reshape any tooth beyond the requested change.
+  Keep the result anatomically plausible and photorealistic.
+layouts:
+  patient_only:
+    roles: [patient]
+    instruction: Apply only the changes listed below.
+  patient_tooth:
+    roles: [patient, tooth]
+    instruction: Apply only the changes listed below. Use image 2 only as a reference for tooth shape, proportions, and arrangement.
+controls:
+  smile:
+    default: 50
+    anchors:
+      "0": Change the facial expression to a relaxed neutral face with the lips closed so that no teeth are visible.
+      "25": Change the facial expression to a gentle closed-mouth smile with the lip corners slightly raised and the lips closed so that no teeth are visible.
+      "50": ""
+      "75": Change the mouth into a smile in which the lower lip rises to completely cover the lower teeth, so that only the row of upper teeth is visible.
+      "100": Change the mouth into a big laughing smile, opening the jaw wider and pulling the lower lip down so that the full row of lower front teeth is exposed below the upper teeth.
+  head_yaw:
+    default: 50
+    anchors:
+      "0": "Head yaw: turn the head clearly to the side so the face points toward the left edge of the image, a three-quarter view."
+      "25": "Head yaw: turn the head slightly so the face points a little toward the left edge of the image."
+      "50": ""
+      "75": "Head yaw: turn the head slightly so the face points a little toward the right edge of the image."
+      "100": "Head yaw: turn the head clearly to the side so the face points toward the right edge of the image, a three-quarter view."
+  head_pitch:
+    default: 50
+    anchors:
+      "0": "Head pitch: tilt the head far down, chin pressed toward the chest, the camera sees the top of the head and the eyes look down."
+      "25": "Head pitch: tilt the head moderately down with the chin lowered."
+      "50": ""
+      "75": "Head pitch: tilt the head moderately up with the chin raised."
+      "100": "Head pitch: tilt the head far back and up, chin raised high, the camera sees under the chin and the eyes look up."
+  # v6까지는 "bright white / very bright cosmetic white"라 결과가 분필처럼 하얘졌다(b* -0.1 ~ -0.7).
+  # v7은 치과 색조(VITA) 기준으로 바꾸고, 단계마다 "순백 금지 + 에나멜 질감/절단연 투명감 유지"를 못박는다.
+  # v8은 여기에 광택(specular highlight) 지시를 더해 무광(matte)/cartoon 느낌을 줄인다.
+  tooth_color:
+    default: 0
+    anchors:
+      "0": ""
+      "25": "Tooth color: remove only the surface stains and discoloration from the teeth, keeping their natural shade. Do not make the teeth whiter than their own natural color."
+      "50": "Tooth color: lighten the teeth to a healthy natural shade, about VITA A2, keeping a warm ivory tone, the natural enamel texture, the slightly translucent incisal edges, and a glossy, light-reflecting enamel surface with natural specular highlights. Do not make them pure white or a flat matte white."
+      "75": "Tooth color: lighten the teeth to a clean bright shade, about VITA A1, keeping a faint warm tone, the enamel texture, the translucent incisal edges, and a glossy, light-reflecting enamel surface with natural specular highlights. Do not make them flat, chalky, matte or pure white."
+      "100": "Tooth color: lighten the teeth to a cosmetic white shade, about VITA B1, still keeping the enamel texture, the slightly translucent incisal edges, and a glossy, light-reflecting enamel surface with natural specular highlights. Do not make them chalky, grey, matte or pure white."
+  alignment:
+    default: 0
+    anchors:
+      "0": ""
+      "25": "Tooth alignment: move only the single most crooked or protruding tooth slightly back toward the dental arch, without reshaping any other tooth."
+      "50": "Tooth alignment: move only the crooked, overlapping, or protruding teeth, such as a snaggletooth, back into line with the neighboring teeth, without reshaping any other tooth."
+      "75": "Tooth alignment: straighten all crooked, overlapping, and protruding teeth into an even dental arch, like after orthodontic treatment."
+      "100": "Tooth alignment: straighten all crooked, overlapping, and protruding teeth into a neat, even, symmetric dental arch, like after complete orthodontic treatment."
+  # 결손·금속은 정렬 문구로 해결되지 않는다. 치아 템플릿과 함께 쓸 때 효과가 난다.
+  restoration:
+    default: 0
+    anchors:
+      "0": ""
+      "50": "Replace every missing tooth: fill each dark gap in the dental arch with a new tooth of natural size and shape that matches the neighboring teeth, so no gap remains."
+      "75": "Replace all metal crowns, silver fillings and dark restorations with natural tooth enamel of the same shade as the neighboring teeth, so no metal is visible anywhere."
+      "100": "Rebuild a complete dental arch: replace every missing tooth so no dark gap remains, and replace all metal crowns and dark restorations with natural tooth enamel of the same shade as the neighboring teeth."
+presets:
+  natural: {}
+
+  # --- 미백 단독 5 (색조 기준) ---------------------------------------------
+  whiten_destain:     {tooth_color: 25}    # 착색만 제거, 원래 색 유지
+  whiten_natural:     {tooth_color: 50}    # VITA A2 — 따뜻한 자연 백색
+  whiten_bright:      {tooth_color: 75}    # VITA A1 — 밝지만 온기 남김
+  whiten_cosmetic:    {tooth_color: 100}   # VITA B1 — 가장 밝음, 그래도 순백 아님
+  whiten_demetal:     {tooth_color: 75, restoration: 75}
+
+  # --- 정렬 단독 5 ---------------------------------------------------------
+  align_snaggle:      {alignment: 50}
+  align_light:        {alignment: 75}
+  align_full:         {alignment: 100}
+  align_gap:          {alignment: 100, restoration: 50}
+  align_restore:      {alignment: 100, restoration: 100}
+
+  # --- 통합(정렬 + 미백) ---------------------------------------------------
+  teeth_destain:      {alignment: 100, tooth_color: 25}   # 정렬 + 착색 제거만
+  teeth_natural:      {alignment: 100, tooth_color: 50}   # 정렬 + A2
+  teeth_basic:        {alignment: 100, tooth_color: 75}   # 정렬 + A1  ← 권장
+  teeth_cosmetic:     {alignment: 100, tooth_color: 100}  # 정렬 + B1
+  teeth_soft:         {alignment: 75,  tooth_color: 50}   # 약한 정렬 + A2
+  teeth_restore:      {alignment: 100, tooth_color: 75,  restoration: 100}
+  teeth_restore_max:  {alignment: 100, tooth_color: 100, restoration: 100}
+
+  # --- 고개 / 웃음 ---------------------------------------------------------
+  turn_left:          {head_yaw: 0}
+  turn_left_soft:     {head_yaw: 25}
+  turn_right_soft:    {head_yaw: 75}
+  turn_right:         {head_yaw: 100}
+  look_up:            {head_pitch: 100}
+  look_down:          {head_pitch: 0}
+  smile_closed:       {smile: 0}
+  smile_closed_lip:   {smile: 25}
+  smile_upper:        {smile: 75}
+  smile_full:         {smile: 100}
+
+  # --- 고개 + 웃음 조합 (따로 돌리면 뒤 단계가 앞을 되돌린다) ---------------
+  yaw25_smile_closed: {head_yaw: 25, smile: 0}
+  yaw25_smile_upper:  {head_yaw: 25, smile: 75}
+  yaw25_smile_full:   {head_yaw: 25, smile: 100}
+  yaw75_smile_closed: {head_yaw: 75, smile: 0}
+  yaw75_smile_upper:  {head_yaw: 75, smile: 75}
+  yaw75_smile_full:   {head_yaw: 75, smile: 100}
+grids:
+  align_color:
+    attributes: [alignment, tooth_color]
+  yaw_pitch:
+    attributes: [head_yaw, head_pitch]
+mice:
+  global:
+    default: Edit image 1, a photo of this person. {reference_instructions} Keep exactly the same person. Change only what the separate region instructions describe.
+  regions:
+    teeth_white:
+      region: [teeth, inner_mouth]
+      prompt: Make these teeth a clean natural bright white color with a glossy, light-reflecting enamel surface, not a flat matte white.
+    teeth_align:
+      region: [mouth]
+      prompt: Straighten the crooked, overlapping, or protruding teeth, such as a snaggletooth, into an even dental arch like after orthodontic treatment.
+    teeth_restore:
+      region: [mouth]
+      prompt: "Rebuild a complete dental arch: replace every missing tooth so no dark gap remains, replace all metal crowns with natural white enamel, and straighten the teeth into an even arch."
+    teeth_from_template:
+      region: [mouth]
+      prompt: Replace the shape, proportions, size, and arrangement of these teeth with the teeth shown in image 2, keeping a natural bright white color. Ignore the background of image 2.
