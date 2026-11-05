@@ -529,7 +529,7 @@ nohup으로 백그라운드에 놓인 뒤에도 깔끔하게 둘 다 종료할 �
 ~~~bash
 nohup python my/unified_server.py --flux-port 8605 --wan-port 8606 \
   --wan-repo /workspace/repo/iSmileNet \
-  --wan-extra-args "--models wan --transformer_dir .../Wan2.2-TI2V-5B-Turbo" > logs/uni_server.log 2>&1 &
+  --wan-extra-args "--models wan --transformer_dir /data1/jooyonglee/public/img2vid/wan/Wan2.2-TI2V-5B-Turbo --prompt_embeddings /workspace/repo/iSmileNet/smiledesign/img2vid/prompt_embeddings/wan22_turbo_smile_styles.pt" > logs/uni_server.log 2>&1 &
 echo $! > logs/uni_server.pid
 ~~~
 
@@ -558,3 +558,9 @@ pkill -f "backend_server\.\.py"
 nvidia-smi --query-gpu=memory.used,memory.total --format=csv
 ~~~
 
+
+<!-- ps aux | grep -E "unified_server|design_tune_server|backend_server" | grep -v grep
+echo "---"
+ss -tlnp 2>/dev/null | grep -E "8605|8606" || netstat -tlnp 2>/dev/null | grep -E "8605|8606"
+echo "--- nvidia-smi ---"
+nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader -->

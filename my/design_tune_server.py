@@ -653,6 +653,11 @@ class InferenceEngine:
             finally:
                 if hook is not None:
                     hook.remove()
+            # PyTorch keeps freed CUDA memory cached for its own reuse rather than returning it to the
+            # driver; without this, another process sharing the GPU (e.g. the img2vid backend_server
+            # under unified_server.py --serialize-gpu) sees it as still unavailable even though this
+            # request is done with it.
+            torch.cuda.empty_cache()
         if generated.size != original_size:
             generated = generated.resize(original_size, Image.Resampling.LANCZOS)
         if mask_image is not None:
@@ -745,6 +750,7 @@ class InferenceEngine:
                     current = current.resize(original_size, Image.Resampling.LANCZOS)
                 union = mask if union is None else union | mask
                 edit_metadata.append({"prompt": name, "regions": regions, "mask_pixels": int((mask > 0).sum())})
+            torch.cuda.empty_cache()
         union_mask = Image.fromarray(union, mode="L").filter(ImageFilter.GaussianBlur(mask_options["feather"]))
         generated = Image.composite(current.convert("RGB"), patient, union_mask)
         metadata = {
