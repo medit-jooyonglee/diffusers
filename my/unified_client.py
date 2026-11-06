@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import subprocess
 import sys
 import time
@@ -70,7 +69,7 @@ def design_tune_infer(args: argparse.Namespace, output_path: Path) -> dict:
     return metadata
 
 
-def wan_generate(args: argparse.Namespace, image_path: Path) -> dict:
+def wan_generate(args: argparse.Namespace, image_path: Path, output_path: Path) -> dict:
     turbo = args.wan_backend == "wan-turbo"
     sampling_steps = args.sampling_steps if args.sampling_steps is not None else (4 if turbo else 50)
     guide_scale = args.guide_scale if args.guide_scale is not None else (1.0 if turbo else 5.0)
@@ -87,8 +86,12 @@ def wan_generate(args: argparse.Namespace, image_path: Path) -> dict:
         response = requests.post(f"{args.wan_server}/generate", data=data, files=files, timeout=args.wan_timeout)
     if response.status_code != 200:
         sys.exit(f"HTTP {response.status_code}: {response.text}")
-    result = response.json()
+    # Server returns the video itself as the body; metadata rides in a header (same pattern as
+    # design_tune_infer's X-Design-Tune-Metadata above).
+    output_path.write_bytes(response.content)
+    result = json.loads(response.headers.get("X-Img2Vid-Metadata", "{}"))
     result["_elapsed_sec"] = round(time.time() - started, 1)
+    result["local_video_path"] = str(output_path)
     return result
 
 
@@ -135,16 +138,9 @@ def main() -> None:
         print(f"      saved {edited_path} ({flux_metadata['_elapsed_sec']}s)")
 
         print(f"[2/2] img2vid backend_server ({args.wan_backend}) on {edited_path}")
-        wan_result = wan_generate(args, edited_path)
-        print(f"      saved {wan_result['video_path']} ({wan_result['_elapsed_sec']}s)")
-
-        # img2vid backend_server writes video.mp4 under its own repo's output tree; copy it next to
-        # flux_edit.png so one pipeline run has a single self-contained output folder.
-        source_video = Path(wan_result["video_path"])
-        local_video = args.output_dir / source_video.name
-        shutil.copy2(source_video, local_video)
-        wan_result["local_video_path"] = str(local_video)
-        print(f"      copied to {local_video}")
+        video_path = args.output_dir / "video.mp4"
+        wan_result = wan_generate(args, edited_path, video_path)
+        print(f"      saved {video_path} ({wan_result['_elapsed_sec']}s)")
     finally:
         if monitor is not None:
             monitor.terminate()

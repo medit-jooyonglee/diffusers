@@ -653,6 +653,12 @@ class InferenceEngine:
             finally:
                 if hook is not None:
                     hook.remove()
+            if self.args.cpu_offload:
+                # enable_model_cpu_offload leaves the last-used submodule resident on GPU until the
+                # next forward call, so without this a sibling process sharing the GPU (e.g. the
+                # img2vid backend_server under unified_server.py) would see that memory as still
+                # unavailable even though this request is done with it.
+                self.pipeline.maybe_free_model_hooks()
             # PyTorch keeps freed CUDA memory cached for its own reuse rather than returning it to the
             # driver; without this, another process sharing the GPU (e.g. the img2vid backend_server
             # under unified_server.py --serialize-gpu) sees it as still unavailable even though this
@@ -750,6 +756,8 @@ class InferenceEngine:
                     current = current.resize(original_size, Image.Resampling.LANCZOS)
                 union = mask if union is None else union | mask
                 edit_metadata.append({"prompt": name, "regions": regions, "mask_pixels": int((mask > 0).sum())})
+            if self.args.cpu_offload:
+                self.pipeline.maybe_free_model_hooks()
             torch.cuda.empty_cache()
         union_mask = Image.fromarray(union, mode="L").filter(ImageFilter.GaussianBlur(mask_options["feather"]))
         generated = Image.composite(current.convert("RGB"), patient, union_mask)
@@ -1266,6 +1274,8 @@ def create_app(args: argparse.Namespace | None = None) -> Flask:
         except (ValueError, TypeError, KeyError) as error:
             return json_error(str(error), 400)
         except torch.OutOfMemoryError as error:
+            if args.cpu_offload and engine.pipeline is not None:
+                engine.pipeline.maybe_free_model_hooks()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             return json_error(f"CUDA out of memory: {error}", 507)
@@ -1360,6 +1370,8 @@ def create_app(args: argparse.Namespace | None = None) -> Flask:
         except (ValueError, TypeError, KeyError) as error:
             return json_error(str(error), 400)
         except torch.OutOfMemoryError as error:
+            if args.cpu_offload and engine.pipeline is not None:
+                engine.pipeline.maybe_free_model_hooks()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             return json_error(f"CUDA out of memory: {error}", 507)
